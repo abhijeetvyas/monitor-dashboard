@@ -89,6 +89,14 @@ app.get('/api/debug/coolify', async (_req, res) => {
   if (!coolifyConfigured()) return res.status(503).json({ error: 'COOLIFY_TOKEN / COOLIFY_BASE_URL not set' });
   let baseHost = null;
   try { baseHost = new URL(coolifyBase()).host; } catch (e) { baseHost = 'unparseable: ' + e.message; }
+  // Token shape diagnostics (no secret content — lengths and charset only).
+  const tok = process.env.COOLIFY_TOKEN || '';
+  const tokenShape = {
+    length: tok.length,
+    hasWhitespace: /\s/.test(tok),
+    printableAsciiOnly: /^[\x21-\x7e]+$/.test(tok),
+    hasPipe: tok.includes('|'),
+  };
   const steps = [];
   async function stepFetch(name, path_, authed) {
     const t0 = Date.now();
@@ -114,7 +122,7 @@ app.get('/api/debug/coolify', async (_req, res) => {
     const now = Math.floor(Date.now() / 1000);
     await stepFetch(`GET /servers/${u}/metrics (auth)`, `/api/v1/servers/${u}/metrics?from=${now - 3600}&to=${now}`, true);
   }
-  res.json({ baseHost, steps, serverUuids });
+  res.json({ baseHost, tokenShape, steps, serverUuids });
 });
 
 // ---------------------------------------------------------------------------

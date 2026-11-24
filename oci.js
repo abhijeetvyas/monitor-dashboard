@@ -27,6 +27,13 @@ async function ociFetch(url, options = {}, timeoutMs = 15000) {
   }
 }
 
+// Usage API is region-scoped; override with OCI_USAGE_REGION if the tenancy's
+// home region differs from the server's region.
+function usageHost() {
+  const region = process.env.OCI_USAGE_REGION || (process.env.OCI_REGION || '').trim();
+  return `usageapi.${region}.oci.oraclecloud.com`;
+}
+
 function ociRequest(host, method, path_, body) {
   const c = ociConfig();
   const url = `https://${host}${path_}`;
@@ -61,7 +68,7 @@ function ociRequest(host, method, path_, body) {
 // Month-to-date OCI spend, from the Usage API (Cost query, daily granularity).
 async function ociMonthCost() {
   const c = ociConfig();
-  const host = `usageapi.${c.region}.oci.oracle.com`;
+  const host = usageHost();
   const start = new Date();
   start.setUTCDate(1);
   start.setUTCHours(0, 0, 0, 0);
@@ -91,7 +98,18 @@ async function ociMonthCost() {
 // Diagnostic: config sanity + endpoint reachability + a real signed runQuery.
 async function ociProbe() {
   const c = ociConfig();
-  const host = `usageapi.${c.region}.oci.oracle.com`;
+  const host = usageHost();
+  const k = c.privateKey;
+  const keyLines = k.split('\n');
+  const keyShape = {
+    totalLength: k.length,
+    lineCount: keyLines.length,
+    lineLengths: keyLines.map((l) => l.length).slice(0, 40),
+    firstLine: keyLines[0] || '',   // should be exactly "-----BEGIN PRIVATE KEY-----" or RSA variant
+    lastLine: keyLines[keyLines.length - 1] || (keyLines[keyLines.length - 2] || ''),
+    hasWhitespaceInsideBase64: /[^A-Za-z0-9+/=\n-]/.test(k.replace(/-----(BEGIN|END)[^-]*-----/g, '')),
+    endsWithNewline: /\n$/.test(k),
+  };
   const steps = [];
   const t0 = Date.now();
   try {
@@ -108,8 +126,9 @@ async function ociProbe() {
   }
   return {
     region: c.region,
-    keyLooksLikePem: c.privateKey.includes('PRIVATE KEY'),
-    keyLineCount: c.privateKey.split('\n').length,
+    usageHost: host,
+    keyLooksLikePem: k.includes('PRIVATE KEY'),
+    keyShape,
     steps,
   };
 }
