@@ -204,11 +204,14 @@ async function ociComputeMetrics(minutes = 180) {
     }
     throw new Error(`Telemetry ${metric}: ${JSON.stringify(attempts.slice(0, 4))}`);
   };
-  const [cpu, memory, filesystem] = await Promise.all([summarize('CpuUtilization'), summarize('MemoryUtilization'), summarize('FilesystemCapacityUtilization')]);
+  // Discover the reader host with one cheap metric first, then query the rest
+  // only against the winner (keeps call count + rate-limit exposure low).
+  const cpuBody = await summarize('CpuUtilization');
+  const [memory, filesystem] = await Promise.all([summarize('MemoryUtilization'), summarize('FilesystemCapacityUtilization')]);
   return {
     minutes,
     host: telemetryHostCache,
-    cpu: seriesFor(cpu, 'CpuUtilization'),
+    cpu: seriesFor(cpuBody, 'CpuUtilization'),
     memory: seriesFor(memory, 'MemoryUtilization'),
     filesystem: seriesFor(filesystem, 'FilesystemCapacityUtilization'),
   };
@@ -297,7 +300,7 @@ async function ociProbe() {
       datapoints: { cpu: t.cpu.length, memory: t.memory.length, filesystem: t.filesystem.length },
     });
   } catch (e) {
-    steps.push({ step: 'telemetry oci_computeagent (1h)', ok: false, error: e.message.slice(0, 250) });
+    steps.push({ step: 'telemetry oci_computeagent (1h)', ok: false, error: e.message.slice(0, 700) });
   }
   // Region matrix: the /usage query against other region endpoints. Answers
   // "region-locked?" vs "query wrong?" for the cost panel debugging history.
