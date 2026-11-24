@@ -217,6 +217,44 @@ async function ociProbe() {
   } catch (e) {
     steps.push({ step: 'signed GET identity tenancy (credential check)', ok: false, error: e.message });
   }
+  // IAM visibility: if the signature is valid but the user can't even LIST
+  // compartments, the IAM user has no useful grants — policies are the problem.
+  {
+    const t0 = Date.now();
+    try {
+      const r = await ociRequest(`identity.${c.region}.oci.oraclecloud.com`, 'GET', '/20160918/compartments', null);
+      const body = await r.json().catch(() => ({}));
+      steps.push({
+        step: 'GET identity compartments (IAM visibility)',
+        ok: r.ok,
+        status: r.status,
+        ms: Date.now() - t0,
+        count: Array.isArray(body) ? body.length : undefined,
+        bodyPreview: r.ok ? undefined : JSON.stringify(body).slice(0, 150),
+      });
+    } catch (e) {
+      steps.push({ step: 'GET identity compartments (IAM visibility)', ok: false, ms: Date.now() - t0, error: e.message });
+    }
+  }
+  // POST-signature sanity: a deliberate missing-fields body to the cost
+  // endpoint. Signature/auth OK => 400 InvalidParameter; broken => 401/404
+  // auth-style errors. Separates "signing code bug" from "IAM policy".
+  {
+    const t0 = Date.now();
+    try {
+      const r = await ociRequest(host, 'POST', '/20200107/usage', { probe: true });
+      const body = await r.json().catch(() => ({}));
+      steps.push({
+        step: 'POST /20200107/usage bad-body (POST-signature probe)',
+        ok: r.status === 400 || r.status === 422 || r.status === 200,
+        status: r.status,
+        ms: Date.now() - t0,
+        bodyPreview: JSON.stringify(body).slice(0, 200),
+      });
+    } catch (e) {
+      steps.push({ step: 'POST /20200107/usage bad-body (POST-signature probe)', ok: false, ms: Date.now() - t0, error: e.message });
+    }
+  }
   // Direct-from-Oracle compute metrics: proves the IAM user can read monitoring
   // data (different service + policy from the Usage API).
   try {
