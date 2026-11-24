@@ -16,6 +16,17 @@ function ociConfigured() {
   return Boolean(c.tenancy && c.user && c.region && c.fingerprint && c.privateKey.includes('PRIVATE KEY'));
 }
 
+// Outbound fetch with a hard timeout and a descriptive error, so hangs and
+// connection failures carry the real cause (DNS/TLS/refused) instead of "fetch failed".
+async function ociFetch(url, options = {}, timeoutMs = 15000) {
+  try {
+    return await fetch(url, { ...options, signal: AbortSignal.timeout(timeoutMs) });
+  } catch (e) {
+    const cause = e && e.cause ? ` [${e.cause.code || e.cause}]` : '';
+    throw new Error(`fetch ${url} failed: ${e.message}${cause}`);
+  }
+}
+
 function ociRequest(host, method, path_, body) {
   const c = ociConfig();
   const url = `https://${host}${path_}`;
@@ -35,7 +46,7 @@ function ociRequest(host, method, path_, body) {
   const signature = crypto.createSign('RSA-SHA256').update(signingString).sign(c.privateKey, 'base64');
   const authorization = `Signature version="1",keyId="${c.tenancy}/${c.user}/${c.fingerprint}",algorithm="rsa-sha256",headers="${headers.join(' ')}",signature="${signature}"`;
 
-  return fetch(url, {
+  return ociFetch(url, {
     method,
     headers: {
       date,
@@ -66,7 +77,7 @@ async function ociMonthCost() {
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) throw new Error(body.message || `OCI Usage API ${res.status}`);
-  const items = body.items || body || [];
+  const items = Array.isArray(body.items) ? body.items : (Array.isArray(body) ? body : []);
   return {
     currency: (items[0] && items[0].currency) || 'USD',
     days: items.map((i) => ({
@@ -77,4 +88,30 @@ async function ociMonthCost() {
   };
 }
 
-module.exports = { ociConfigured, ociMonthCost };
+// Diagnostic: config sanity + endpoint reachability + a real signed runQuery.
+async function ociProbe() {
+  const c = ociConfig();
+  const host = `usageapi.${c.region}.oci.oracle.com`;
+  const steps = [];
+  const t0 = Date.now();
+  try {
+    const r = await ociFetch(`https://${host}/`, {}, 8000);
+    steps.push({ step: 'reachability GET /', ok: r.status < 500, status: r.status, ms: Date.now() - t0, bodyPreview: (await r.text()).slice(0, 120) });
+  } catch (e) {
+    steps.push({ step: 'reachability GET /', ok: false, ms: Date.now() - t0, error: e.message });
+  }
+  try {
+    const cost = await ociMonthCost();
+    steps.push({ step: 'signed runQuery (month cost)', ok: true, summary: { total: cost.total, currency: cost.currency, days: cost.days.length } });
+  } catch (e) {
+    steps.push({ step: 'signed runQuery (month cost)', ok: false, error: e.message });
+  }
+  return {
+    region: c.region,
+    keyLooksLikePem: c.privateKey.includes('PRIVATE KEY'),
+    keyLineCount: c.privateKey.split('\n').length,
+    steps,
+  };
+}
+
+module.exports = { ociConfigured, ociMonthCost, ociProbe };
