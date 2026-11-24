@@ -1,3 +1,8 @@
+// Month-day UTC string (no fraction): the Usage API demands hours/min/sec = 0.
+function dayIso(d) {
+  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
 // OCI request signing (API key auth) — per Oracle's request-signing spec.
 const crypto = require('crypto');
 
@@ -35,13 +40,17 @@ function usageHost() {
 }
 
 // Telemetry (monitoring) API — same signing, different service per region.
-// The reader host differs between realms: telemetry.<r>.oci.oraclecloud.com vs
-// telemetry.<r>.oraclecloud.com (on some regions the .oci. host routes to the
-// ingestion service and POSTs there fail with a "use telemetry-ingestion" hint).
-// Update with OCI_METRICS_REGION to override the region.
+// Reader host differs between realms: telemetry.<r>.oci.oraclecloud.com vs
+// monitoring.<r>.oraclecloud.com (some regions route telemetry.* POSTs to the
+// ingestion service instead). OCI_METRICS_REGION / OCI_TELEMETRY_HOST override.
 function telemetryHosts() {
   const region = process.env.OCI_METRICS_REGION || (process.env.OCI_REGION || '').trim();
-  const hosts = [`telemetry.${region}.oci.oraclecloud.com`, `telemetry.${region}.oraclecloud.com`];
+  const hosts = [
+    `telemetry.${region}.oci.oraclecloud.com`,
+    `monitoring.${region}.oraclecloud.com`,
+    `telemetry.${region}.oraclecloud.com`,
+    `monitoring.${region}.oci.oraclecloud.com`,
+  ];
   if (process.env.OCI_TELEMETRY_HOST) hosts.unshift(process.env.OCI_TELEMETRY_HOST);
   return hosts;
 }
@@ -83,14 +92,18 @@ function ociRequest(host, method, path_, body) {
 async function ociMonthCost(hostOverride) {
   const c = ociConfig();
   const host = hostOverride || usageHost();
+  // The Usage API validates full-day UTC precision: hours/min/sec/none must be
+  // zero. Month start → first midnight after "now" (tomorrow, per its docs).
   const start = new Date();
   start.setUTCDate(1);
   start.setUTCHours(0, 0, 0, 0);
-  const end = new Date(Date.now() + 24 * 3600 * 1000); // usage API needs the day boundary
+  const end = new Date(Date.now());
+  end.setUTCHours(0, 0, 0, 0);
+  end.setUTCDate(end.getUTCDate() + 1);
   const common = {
     tenantId: c.tenancy,
-    timeUsageStarted: start.toISOString(),
-    timeUsageEnded: end.toISOString(),
+    timeUsageStarted: dayIso(start),
+    timeUsageEnded: dayIso(end),
     granularity: 'DAILY',
   };
 
@@ -106,11 +119,10 @@ async function ociMonthCost(hostOverride) {
     };
   };
 
-  // Auth is proven (the 400s from stockholm were signature-validated); the
-  // remaining variable is the exact body shape of RequestSummarizedUsages.
+  // Auth is proven; the only variable is the request body shape.
   const variants = [
-    { name: 'queryType array', body: { ...common, queryType: ['COST'] } },
     { name: 'queryType string', body: { ...common, queryType: 'COST' } },
+    { name: 'queryType array', body: { ...common, queryType: ['COST'] } },
   ];
   const errors = [];
   for (const v of variants) {
@@ -170,25 +182,27 @@ async function ociComputeMetrics(minutes = 180) {
   };
 
   // Try the cached-good reader host first, then discover among the candidates.
+  const probes = [];
   const summarize = async (metric) => {
     const hosts = [];
     if (telemetryHostCache) hosts.push(telemetryHostCache);
     for (const h of telemetryHosts()) if (!hosts.includes(h)) hosts.push(h);
-    let lastErr = '';
+    const attempts = [];
     for (const h of hosts) {
+      const t0 = Date.now();
       try {
         const res = await ociRequest(h, 'POST', '/20180401/metrics', { ...base, name: metric });
         const body = await res.json().catch(() => ({}));
+        attempts.push({ host: h, status: res.status, ms: Date.now() - t0, body: errCode(body) || body });
         if (res.ok) {
           telemetryHostCache = h;
           return body;
         }
-        lastErr = `${h}: ${res.status} ${JSON.stringify(errCode(body) || body).slice(0, 200)}`;
       } catch (e) {
-        lastErr = `${h}: ${e.message}`;
+        attempts.push({ host: h, error: e.message, ms: Date.now() - t0 });
       }
     }
-    throw new Error(`Telemetry ${metric} — ${lastErr}`);
+    throw new Error(`Telemetry ${metric}: ${JSON.stringify(attempts.slice(0, 4))}`);
   };
   const [cpu, memory, filesystem] = await Promise.all([summarize('CpuUtilization'), summarize('MemoryUtilization'), summarize('FilesystemCapacityUtilization')]);
   return {
@@ -272,25 +286,6 @@ async function ociProbe() {
       steps.push({ step: 'GET identity compartments (IAM visibility)', ok: false, ms: Date.now() - t0, error: e.message });
     }
   }
-  // POST-signature sanity: a deliberate missing-fields body to the cost
-  // endpoint. Signature/auth OK => 400 InvalidParameter; broken => 401/404
-  // auth-style errors. Separates "signing code bug" from "IAM policy".
-  {
-    const t0 = Date.now();
-    try {
-      const r = await ociRequest(host, 'POST', '/20200107/usage', { probe: true });
-      const body = await r.json().catch(() => ({}));
-      steps.push({
-        step: 'POST /20200107/usage bad-body (POST-signature probe)',
-        ok: r.status === 400 || r.status === 422 || r.status === 200,
-        status: r.status,
-        ms: Date.now() - t0,
-        bodyPreview: JSON.stringify(body).slice(0, 200),
-      });
-    } catch (e) {
-      steps.push({ step: 'POST /20200107/usage bad-body (POST-signature probe)', ok: false, ms: Date.now() - t0, error: e.message });
-    }
-  }
   // Direct-from-Oracle compute metrics: proves the IAM user can read monitoring
   // data (different service + policy from the Usage API).
   try {
@@ -304,46 +299,32 @@ async function ociProbe() {
   } catch (e) {
     steps.push({ step: 'telemetry oci_computeagent (1h)', ok: false, error: e.message.slice(0, 250) });
   }
-  // Cost: the classic RequestSummarizedUsages endpoint — a different resource
-  // from /actions/runQuery, with different IAM requirements.
-  {
-    const t0 = Date.now();
-    try {
-      const start = new Date();
-      start.setUTCDate(1);
-      start.setUTCHours(0, 0, 0, 0);
-      const end = new Date(Date.now() + 24 * 3600 * 1000);
-      const res = await ociRequest(host, 'POST', '/20200107/usage', {
-        tenantId: c.tenancy,
-        queryType: ['COST'],
-        granularity: 'DAILY',
-        timeUsageStarted: start.toISOString(),
-        timeUsageEnded: end.toISOString(),
-      });
-      const body = await res.json().catch(() => ({}));
-      steps.push({
-        step: 'POST /20200107/usage (RequestSummarizedUsages)',
-        ok: res.ok,
-        status: res.status,
-        ms: Date.now() - t0,
-        items: Array.isArray(body.items) ? body.items.length : undefined,
-        bodyPreview: res.ok ? undefined : JSON.stringify(body).slice(0, 200),
-      });
-    } catch (e) {
-      steps.push({ step: 'POST /20200107/usage (RequestSummarizedUsages)', ok: false, ms: Date.now() - t0, error: e.message });
-    }
-  }
-  // Region matrix: sign the identical runQuery against other region endpoints.
-  // If these succeed, the stockholm endpoint rejects the query itself (service
-  // gating/region scope); if they 404 too, the problem is the query/IAM, not the region.
+  // Region matrix: the /usage query against other region endpoints. Answers
+  // "region-locked?" vs "query wrong?" for the cost panel debugging history.
+  // (Cross-region auth was rejected with 401 on 2026-11-24 — kept as one call
+  // per host for regression evidence, without the retry variants to stay under
+  // the Usage API's rate limit.)
+  const dayNow = new Date();
+  const startDay = new Date(dayNow);
+  startDay.setUTCDate(1); startDay.setUTCHours(0, 0, 0, 0);
+  const endDay = new Date(dayNow);
+  endDay.setUTCHours(0, 0, 0, 0);
+  endDay.setUTCDate(endDay.getUTCDate() + 1);
   const altHosts = ['usageapi.eu-frankfurt-1.oci.oraclecloud.com', 'usageapi.us-ashburn-1.oci.oraclecloud.com'];
   for (const alt of altHosts.filter((h) => h !== host)) {
     const t0 = Date.now();
     try {
-      const cost = await ociMonthCost(alt);
-      steps.push({ step: `runQuery vs ${alt}`, ok: true, ms: Date.now() - t0, summary: { total: cost.total, days: cost.days.length } });
+      const r = await ociRequest(alt, 'POST', '/20200107/usage', {
+        tenantId: c.tenancy,
+        queryType: 'COST',
+        granularity: 'DAILY',
+        timeUsageStarted: dayIso(startDay),
+        timeUsageEnded: dayIso(endDay),
+      });
+      const body = await r.json().catch(() => ({}));
+      steps.push({ step: `/usage vs ${alt}`, ok: r.ok, status: r.status, ms: Date.now() - t0, bodyPreview: r.ok ? undefined : JSON.stringify({ code: body.code, message: body.message }).slice(0, 150) });
     } catch (e) {
-      steps.push({ step: `runQuery vs ${alt}`, ok: false, ms: Date.now() - t0, error: e.message });
+      steps.push({ step: `/usage vs ${alt}`, ok: false, ms: Date.now() - t0, error: e.message });
     }
   }
   return {
