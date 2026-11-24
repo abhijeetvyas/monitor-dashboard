@@ -100,8 +100,22 @@ async function loadTraffic() {
 }
 
 async function loadCost() {
+  if (!statusCache.panels.oci) return;
   const r = await fetch('/api/oci/cost');
-  if (!r.ok) return; // placeholder keeps its note
+  const body = document.getElementById('oci-body');
+  if (!r.ok) { body.innerHTML = `<div class="warn">Cost panel: ${(await r.json()).error}</div>`; return; }
+  const data = await r.json();
+  const cur = data.currency === 'USD' ? '$' : data.currency + ' ';
+  const dayLabels = data.days.map((d) => d.date.slice(8) + '/' + d.date.slice(5, 7));
+  body.innerHTML = `
+    <div class="kpi">${cur}${data.total.toFixed(2)} <small>month-to-date</small></div>
+    <div class="note">${data.days.map((d) => (d.date || '?') + ': ' + cur + d.cost.toFixed(2)).slice(-5).join('<br>')}</div>
+    <div class="chart-wrap"><canvas id="chart-cost"></canvas></div>`;
+  new Chart(document.getElementById('chart-cost'), {
+    type: 'bar',
+    data: { labels: dayLabels, datasets: [{ label: 'Daily cost', data: data.days.map((d) => d.cost), backgroundColor: '#58a6ff' }] },
+    options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { color: '#8b96a5' } }, y: { ticks: { color: '#8b96a5' } } }, plugins: { legend: { display: false } } },
+  });
 }
 
 (async () => {

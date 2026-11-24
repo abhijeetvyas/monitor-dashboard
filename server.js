@@ -7,6 +7,7 @@
 
 const express = require('express');
 const path = require('path');
+const { ociConfigured, ociMonthCost } = require('./oci');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -40,7 +41,7 @@ app.get('/api/status', (_req, res) => {
     panels: {
       coolify: coolifyConfigured(),
       cloudflare: Boolean(process.env.CF_API_TOKEN && process.env.CF_ZONE_IDS),
-      oci: Boolean(process.env.OCI_USER && process.env.OCI_TENANCY && process.env.OCI_KEY_FILE),
+      oci: ociConfigured(),
     },
     freeTier: FREE_TIER,
   });
@@ -104,10 +105,15 @@ app.get('/api/cloudflare/traffic', async (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// OCI cost (placeholder endpoint; activated by OCI_* env vars)
+// OCI — month-to-date cost vs free-tier (target: 0, only overage costs money)
 // ---------------------------------------------------------------------------
-app.get('/api/oci/cost', (_req, res) => {
-  res.status(503).json({ error: 'Cost panel not yet activated', configured: Boolean(process.env.OCI_USER) });
+app.get('/api/oci/cost', async (_req, res) => {
+  if (!ociConfigured()) return res.status(503).json({ error: 'OCI_* env vars not set or private key missing' });
+  try {
+    res.json(await ociMonthCost());
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
 });
 
 app.listen(PORT, () => {
