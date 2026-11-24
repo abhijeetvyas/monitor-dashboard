@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Infra Dashboard — AppsForLife</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+  <style>
+    :root {
+      --bg: #0e1116; --card: #171c24; --ink: #e6ebf2; --muted: #8b96a5;
+      --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
+    header { display: flex; align-items: baseline; gap: 12px; padding: 16px 24px 4px; }
+    header h1 { font-size: 18px; margin: 0; }
+    header span { color: var(--muted); font-size: 12px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; padding: 16px 24px 32px; }
+    .card { background: var(--card); border: 1px solid #232b36; border-radius: 10px; padding: 14px 16px; }
+    .card h2 { font-size: 13px; margin: 0 0 2px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
+    .kpi { font-size: 26px; font-weight: 600; }
+    .kpi small { font-size: 13px; font-weight: 400; color: var(--muted); }
+    .bar { height: 6px; background: #232b36; border-radius: 3px; margin-top: 8px; overflow: hidden; }
+    .bar > div { height: 100%; border-radius: 3px; background: var(--ok); }
+    .chart-wrap { position: relative; height: 180px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 6px; border-bottom: 1px solid #232b36; }
+    td { padding: 6px; border-bottom: 1px solid #1c232d; }
+    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
+    .pill.running { background: rgba(63,185,80,.15); color: var(--ok); }
+    .pill.other { background: rgba(248,81,73,.15); color: var(--bad); }
+    .note { color: var(--muted); font-size: 12px; }
+    .warn { color: var(--warn); font-size: 12px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Infra Dashboard</h1>
+    <span>Oracle + Coolify · target: stay within OCI Always Free (4 vCPU · 24 GB RAM)</span>
+  </header>
+
+  <div class="grid">
+    <div class="card"><h2>CPU</h2><div class="kpi" id="cpu-kpi">–</div><div class="bar"><div id="cpu-bar"></div></div><div class="note" id="cpu-note"></div></div>
+    <div class="card"><h2>Memory</h2><div class="kpi" id="mem-kpi">–</div><div class="bar"><div id="mem-bar"></div></div><div class="note" id="mem-note"></div></div>
+    <div class="card"><h2>Disk</h2><div class="kpi" id="disk-kpi">–</div><div class="bar"><div id="disk-bar"></div></div><div class="note" id="disk-note"></div></div>
+
+    <div class="card"><h2>Apps</h2><table id="apps-table"><thead><tr><th>App</th><th>URL</th><th>Status</th></tr></thead><tbody></tbody></table><div class="warn" id="apps-warn"></div></div>
+
+    <div class="card"><h2>CPU & RAM (last hour)</h2><div class="chart-wrap"><canvas id="chart-res"></canvas></div></div>
+    <div class="card"><h2>Network I/O (last hour)</h2><div class="chart-wrap"><canvas id="chart-net"></canvas></div></div>
+
+    <div class="card"><h2>Traffic — Cloudflare (24h)</h2><div id="cf-body"><div class="note">Not configured. Set CF_API_TOKEN + CF_ZONE_IDS.</div></div></div>
+    <div class="card"><h2>Cost — Oracle Cloud</h2><div id="oci-body"><div class="note">Not configured yet. Panel activates with OCI credentials.</div></div></div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
