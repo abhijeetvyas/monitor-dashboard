@@ -181,28 +181,44 @@ async function ociComputeMetrics(minutes = 180) {
     return [...byTs.entries()].sort((a, b) => a[0] - b[0]).map(([ts, acc]) => [ts, acc.sum / acc.n]);
   };
 
-  // Try the cached-good reader host first, then discover among the candidates.
-  const probes = [];
-  const summarize = async (metric) => {
-    const hosts = [];
-    if (telemetryHostCache) hosts.push(telemetryHostCache);
-    for (const h of telemetryHosts()) if (!hosts.includes(h)) hosts.push(h);
+  // Discover the reader host via listMetrics: only the monitoring READ service
+  // serves /20180401/metrics/actions/listMetrics, so a 200 identifies the
+  // reader unambiguously (POST /20180401/metrics alone is ambiguous — it is
+  // also the ingestion route and some realms route it to ingestion).
+  const ensureTelemetryHost = async () => {
+    if (telemetryHostCache) return telemetryHostCache;
+    const hosts = telemetryHosts();
     const attempts = [];
     for (const h of hosts) {
       const t0 = Date.now();
       try {
-        const res = await ociRequest(h, 'POST', '/20180401/metrics', { ...base, name: metric });
+        const res = await ociRequest(h, 'POST', '/20180401/metrics/actions/listMetrics', {
+          compartmentId: base.compartmentId,
+          namespace: base.namespace,
+        });
         const body = await res.json().catch(() => ({}));
-        attempts.push({ host: h, status: res.status, ms: Date.now() - t0, body: errCode(body) || body });
+        const info = errCode(body) || body;
+        attempts.push({ h, s: res.status, ms: Date.now() - t0, body: typeof info === 'object' && info.code ? { code: info.code, message: String(info.message || '').slice(0, 80) } : info });
         if (res.ok) {
           telemetryHostCache = h;
-          return body;
+          return h;
         }
       } catch (e) {
-        attempts.push({ host: h, error: e.message, ms: Date.now() - t0 });
+        attempts.push({ h, ms: Date.now() - t0, error: e.message });
       }
     }
-    throw new Error(`Telemetry ${metric}: ${JSON.stringify(attempts.slice(0, 4))}`);
+    throw new Error(`No telemetry reader host: ${JSON.stringify(attempts.slice(0, 4))}`);
+  };
+
+  const summarize = async (metric) => {
+    const h = await ensureTelemetryHost();
+    const res = await ociRequest(h, 'POST', '/20180401/metrics', { ...base, name: metric });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const info = errCode(body) || body;
+      throw new Error(`Telemetry ${metric} ${res.status} ${JSON.stringify(errCode(info) || info).slice(0, 200)}`);
+    }
+    return body;
   };
   // Discover the reader host with one cheap metric first, then query the rest
   // only against the winner (keeps call count + rate-limit exposure low).
@@ -300,7 +316,7 @@ async function ociProbe() {
       datapoints: { cpu: t.cpu.length, memory: t.memory.length, filesystem: t.filesystem.length },
     });
   } catch (e) {
-    steps.push({ step: 'telemetry oci_computeagent (1h)', ok: false, error: e.message.slice(0, 700) });
+    steps.push({ step: 'telemetry oci_computeagent (1h)', ok: false, error: e.message.slice(0, 1000) });
   }
   // Region matrix: the /usage query against other region endpoints. Answers
   // "region-locked?" vs "query wrong?" for the cost panel debugging history.
