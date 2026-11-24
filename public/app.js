@@ -15,6 +15,15 @@ function setGauge(kpiId, barId, noteId, text, pct, note) {
 }
 
 let statusCache = null;
+let ociMetricsCache = null;
+const chartRegistry = {};
+
+// Chart.js throws "Canvas is already in use" if a new Chart is created on a
+// canvas that still has a live chart — destroy before redrawing.
+function drawChart(canvasId, config) {
+  if (chartRegistry[canvasId]) chartRegistry[canvasId].destroy();
+  chartRegistry[canvasId] = new Chart(document.getElementById(canvasId), config);
+}
 
 async function loadStatus() {
   try {
@@ -63,6 +72,44 @@ function normalizeMetrics(m) {
   };
 }
 
+async function loadOciMetrics() {
+  if (!statusCache.panels.oci) return;
+  try {
+    const r = await fetch('/api/oci/metrics');
+    ociMetricsCache = r.ok ? await r.json() : null;
+  } catch (e) {
+    ociMetricsCache = null;
+  }
+}
+
+// Gauges + resource chart straight from Oracle's Telemetry API
+// (oci_computeagent): CpuUtilization / MemoryUtilization / FilesystemCapacityUtilization.
+function renderOciMetrics(m) {
+  const ft = statusCache.freeTier;
+  const last = (s) => (Array.isArray(s) && s.length ? s[s.length - 1][1] : null);
+  const cpu = last(m.cpu);
+  const memPct = last(m.memory);
+  const diskPct = last(m.filesystem);
+  if (cpu !== null) {
+    setGauge('cpu-kpi', 'cpu-bar', 'cpu-note', `${cpu.toFixed(1)}%`, cpu, 'live from Oracle — CpuUtilization (host)');
+  }
+  if (memPct !== null) {
+    const usedBytes = (memPct / 100) * 24 * 1024 ** 3;
+    setGauge('mem-kpi', 'mem-bar', 'mem-note', `${fmtGB(usedBytes)} <small>used</small>`, memPct,
+      `${memPct.toFixed(0)}% — Oracle MemoryUtilization (of host RAM)`);
+  }
+  if (diskPct !== null) {
+    setGauge('disk-kpi', 'disk-bar', 'disk-note', `${diskPct.toFixed(1)}% <small>used</small>`, diskPct,
+      'Oracle FilesystemCapacityUtilization');
+  }
+  if (m.cpu && m.cpu.length) {
+    const labels = m.cpu.map((p) => new Date(p[0]).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+    // Memory has its own sampling times; only pair it with the CPU axis when aligned.
+    const memAligned = m.memory && m.memory.length === m.cpu.length ? m.memory.map((p) => p[1]) : null;
+    drawRes(labels, m.cpu.map((p) => p[1]), memAligned || m.cpu.map(() => null));
+  }
+}
+
 async function loadCoolify() {
   try {
     const r = await fetch('/api/coolify/resources');
@@ -79,7 +126,19 @@ async function loadCoolify() {
     const cur = nm && nm.current;
     const ft = statusCache.freeTier;
 
-    if (cur) {
+    // Oracle-direct metrics take priority; Coolify/Sentinel is the fallback
+    // (network series only exists there, so keep it when available).
+    const haveOci = ociMetricsCache && ociMetricsCache.cpu && ociMetricsCache.cpu.length > 0;
+    if (haveOci) {
+      renderOciMetrics(ociMetricsCache);
+      if (cur) {
+        const nm2 = nm;
+        if (nm2.series.network_rx_bytes_per_sec && nm2.series.network_rx_bytes_per_sec.length) {
+          const t = (pts) => pts.map((p) => new Date(p[0]).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
+          drawNet(t(nm2.series.network_rx_bytes_per_sec), nm2.series.network_rx_bytes_per_sec.map((p) => p[1]), nm2.series.network_tx_bytes_per_sec.map((p) => p[1]));
+        }
+      }
+    } else if (cur) {
       const totalMem = cur.memory_total_bytes || ft.memoryLimitBytes;
       const memPct = (cur.memory_used_bytes / ft.memoryLimitBytes) * 100;
       const diskPct = (cur.disk_used_bytes / ft.diskLimitBytes) * 100;
@@ -115,7 +174,7 @@ async function loadCoolify() {
 }
 
 function drawRes(labels, cpu, mem) {
-  new Chart(document.getElementById('chart-res'), {
+  drawChart('chart-res', {
     type: 'line',
     data: { labels, datasets: [
       { label: 'CPU %', data: cpu, borderColor: '#58a6ff', tension: .3, pointRadius: 0 },
@@ -126,7 +185,7 @@ function drawRes(labels, cpu, mem) {
 }
 
 function drawNet(labels, rx, tx) {
-  new Chart(document.getElementById('chart-net'), {
+  drawChart('chart-net', {
     type: 'line',
     data: { labels, datasets: [
       { label: 'In', data: rx.map(fmtBps), borderColor: '#3fb950', tension: .3, pointRadius: 0 },
@@ -193,6 +252,10 @@ async function loadCost() {
 
 (async () => {
   await loadStatus();
+  await loadOciMetrics();
   await Promise.allSettled([loadCoolify(), loadTraffic(), loadCost()]);
-  setInterval(loadCoolify, 60_000);
+  setInterval(async () => {
+    await loadOciMetrics();
+    loadCoolify();
+  }, 60_000);
 })();

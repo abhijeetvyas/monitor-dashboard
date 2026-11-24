@@ -34,6 +34,12 @@ function usageHost() {
   return `usageapi.${region}.oci.oraclecloud.com`;
 }
 
+// Telemetry (monitoring) API — same signing, different service per region.
+function telemetryHost() {
+  const region = process.env.OCI_METRICS_REGION || (process.env.OCI_REGION || '').trim();
+  return `telemetry.${region}.oci.oraclecloud.com`;
+}
+
 function ociRequest(host, method, path_, body) {
   const c = ociConfig();
   const url = `https://${host}${path_}`;
@@ -65,8 +71,8 @@ function ociRequest(host, method, path_, body) {
   });
 }
 
-// Month-to-date OCI spend, from the Usage API (Cost query, daily granularity).
-// hostOverride lets the diagnostics probe the same query against other regions.
+// Month-to-date OCI spend. Primary: the classic /usage endpoint
+// (RequestSummarizedUsages). Fallback: /actions/runQuery (older action).
 async function ociMonthCost(hostOverride) {
   const c = ociConfig();
   const host = hostOverride || usageHost();
@@ -74,24 +80,94 @@ async function ociMonthCost(hostOverride) {
   start.setUTCDate(1);
   start.setUTCHours(0, 0, 0, 0);
   const end = new Date(Date.now() + 24 * 3600 * 1000); // usage API needs the day boundary
-  const res = await ociRequest(host, 'POST', '/20200107/actions/runQuery', {
-    queryType: 'COST',
+  const common = {
     tenantId: c.tenancy,
     timeUsageStarted: start.toISOString(),
     timeUsageEnded: end.toISOString(),
     granularity: 'DAILY',
-    filter: { tags: [], compartmentFilters: [], dimensions: [], freeformTagFilters: [] },
-  });
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(`OCI Usage API ${res.status} ${body.code || ''}: ${body.message || 'no message'}`.trim());
-  const items = Array.isArray(body.items) ? body.items : (Array.isArray(body) ? body : []);
+  };
+
+  const parse = (items) => {
+    const arr = Array.isArray(items) ? items : [];
+    return {
+      currency: (arr[0] && arr[0].currency) || 'USD',
+      days: arr.map((i) => ({
+        date: String((i.dimensions && (i.dimensions.timeUsageStarted || i.dimensions.time_usagestarted)) || i.timeUsageStarted || '').slice(0, 10),
+        cost: Number(i.computedAmount ?? i.computedamount ?? i.unblendedCost ?? 0),
+      })),
+      total: arr.reduce((a, i) => a + Number(i.computedAmount ?? i.computedamount ?? i.unblendedCost ?? 0), 0),
+    };
+  };
+
+  let usageErr = null;
+  try {
+    const res = await ociRequest(host, 'POST', '/20200107/usage', { ...common, queryType: ['COST'] });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`OCI /usage ${res.status} ${JSON.stringify(body).slice(0, 300)}`);
+    if (Array.isArray(body.items)) return parse(body.items);
+    throw new Error(`OCI /usage unexpected body ${JSON.stringify(body).slice(0, 200)}`);
+  } catch (e) {
+    usageErr = e;
+  }
+
+  try {
+    const res = await ociRequest(host, 'POST', '/20200107/actions/runQuery', {
+      queryType: 'COST',
+      ...common,
+      filter: { tags: [], compartmentFilters: [], dimensions: [], freeformTagFilters: [] },
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`OCI runQuery ${res.status} ${body.code || ''}: ${body.message || 'no message'}`.trim());
+    return parse(body.items);
+  } catch (e) {
+    throw new Error(`${usageErr.message}; ${e.message}`);
+  }
+}
+
+// Direct-from-Oracle compute metrics via the Telemetry API (oci_computeagent
+// namespace — same API key as everything else, no extra credentials).
+// Returns per-metric series of [timestampMs, value] averaged across dimension
+// streams (the only instance in this tenancy, so streams usually collapse).
+async function ociComputeMetrics(minutes = 180) {
+  const c = ociConfig();
+  const host = telemetryHost();
+  const end = new Date();
+  const start = new Date(Date.now() - minutes * 60 * 1000);
+  const base = {
+    compartmentId: process.env.OCI_COMPARTMENT || c.tenancy,
+    namespace: 'oci_computeagent',
+    startTime: start.toISOString(),
+    endTime: end.toISOString(),
+  };
+  const seriesFor = (metadata, metric) => {
+    const streams = (Array.isArray(metadata) ? metadata : []).map((sd) =>
+      (sd.aggregatedDatapoints || []).map((p) => [Date.parse(p.timestamp), p.value])
+    );
+    // Merge streams by timestamp (mean) so multi-dimension responses stay a single series.
+    const byTs = new Map();
+    for (const stream of streams) {
+      for (const [ts, v] of stream) {
+        const acc = byTs.get(ts) || { sum: 0, n: 0 };
+        acc.sum += v; acc.n += 1;
+        byTs.set(ts, acc);
+      }
+    }
+    return [...byTs.entries()].sort((a, b) => a[0] - b[0]).map(([ts, acc]) => [ts, acc.sum / acc.n]);
+  };
+
+  const grab = async (metric) => {
+    const res = await ociRequest(host, 'POST', '/20180401/metrics', { ...base, name: metric });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(`Telemetry ${metric} ${res.status} ${JSON.stringify(body).slice(0, 300)}`);
+    return seriesFor(body, metric);
+  };
+  const [cpu, memory, filesystem] = await Promise.all([grab('CpuUtilization'), grab('MemoryUtilization'), grab('FilesystemCapacityUtilization')]);
   return {
-    currency: (items[0] && items[0].currency) || 'USD',
-    days: items.map((i) => ({
-      date: String((i.dimensions && (i.dimensions.timeUsageStarted || i.dimensions.time_usagestarted)) || i.timeUsageStarted || '').slice(0, 10),
-      cost: Number(i.computedAmount ?? i.computedamount ?? i.unblendedCost ?? 0),
-    })),
-    total: items.reduce((a, i) => a + Number(i.computedAmount ?? i.computedamount ?? i.unblendedCost ?? 0), 0),
+    minutes,
+    host: host,
+    cpu,
+    memory,
+    filesystem,
   };
 }
 
@@ -141,6 +217,47 @@ async function ociProbe() {
   } catch (e) {
     steps.push({ step: 'signed GET identity tenancy (credential check)', ok: false, error: e.message });
   }
+  // Direct-from-Oracle compute metrics: proves the IAM user can read monitoring
+  // data (different service + policy from the Usage API).
+  try {
+    const t = await ociComputeMetrics(60);
+    steps.push({
+      step: 'telemetry oci_computeagent (1h)',
+      ok: t.cpu.length > 0 || t.memory.length > 0,
+      datapoints: { cpu: t.cpu.length, memory: t.memory.length, filesystem: t.filesystem.length },
+    });
+  } catch (e) {
+    steps.push({ step: 'telemetry oci_computeagent (1h)', ok: false, error: e.message.slice(0, 250) });
+  }
+  // Cost: the classic RequestSummarizedUsages endpoint — a different resource
+  // from /actions/runQuery, with different IAM requirements.
+  {
+    const t0 = Date.now();
+    try {
+      const start = new Date();
+      start.setUTCDate(1);
+      start.setUTCHours(0, 0, 0, 0);
+      const end = new Date(Date.now() + 24 * 3600 * 1000);
+      const res = await ociRequest(host, 'POST', '/20200107/usage', {
+        tenantId: c.tenancy,
+        queryType: ['COST'],
+        granularity: 'DAILY',
+        timeUsageStarted: start.toISOString(),
+        timeUsageEnded: end.toISOString(),
+      });
+      const body = await res.json().catch(() => ({}));
+      steps.push({
+        step: 'POST /20200107/usage (RequestSummarizedUsages)',
+        ok: res.ok,
+        status: res.status,
+        ms: Date.now() - t0,
+        items: Array.isArray(body.items) ? body.items.length : undefined,
+        bodyPreview: res.ok ? undefined : JSON.stringify(body).slice(0, 200),
+      });
+    } catch (e) {
+      steps.push({ step: 'POST /20200107/usage (RequestSummarizedUsages)', ok: false, ms: Date.now() - t0, error: e.message });
+    }
+  }
   // Region matrix: sign the identical runQuery against other region endpoints.
   // If these succeed, the stockholm endpoint rejects the query itself (service
   // gating/region scope); if they 404 too, the problem is the query/IAM, not the region.
@@ -163,4 +280,4 @@ async function ociProbe() {
   };
 }
 
-module.exports = { ociConfigured, ociMonthCost, ociProbe };
+module.exports = { ociConfigured, ociMonthCost, ociComputeMetrics, ociProbe };

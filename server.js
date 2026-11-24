@@ -7,7 +7,7 @@
 
 const express = require('express');
 const path = require('path');
-const { ociConfigured, ociMonthCost, ociProbe } = require('./oci');
+const { ociConfigured, ociMonthCost, ociComputeMetrics, ociProbe } = require('./oci');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -253,6 +253,17 @@ app.get('/api/oci/cost', async (_req, res) => {
   if (!ociConfigured()) return res.status(503).json({ error: 'OCI_* env vars not set or private key missing' });
   try {
     res.json(await ociMonthCost());
+  } catch (e) {
+    res.status(502).json({ error: e.message });
+  }
+});
+
+// Direct-from-Oracle compute metrics (Telemetry API, oci_computeagent):
+// CPU / memory / filesystem utilization series — not proxied via Coolify.
+app.get('/api/oci/metrics', async (_req, res) => {
+  if (!ociConfigured()) return res.status(503).json({ error: 'OCI_* env vars not set or private key missing' });
+  try {
+    res.json(await ociComputeMetrics(180));
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
