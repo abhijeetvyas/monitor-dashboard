@@ -83,7 +83,7 @@ async function ociMonthCost() {
     filter: { tags: [], compartmentFilters: [], dimensions: [], freeformTagFilters: [] },
   });
   const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.message || `OCI Usage API ${res.status}`);
+  if (!res.ok) throw new Error(`OCI Usage API ${res.status} ${body.code || ''}: ${body.message || 'no message'}`.trim());
   const items = Array.isArray(body.items) ? body.items : (Array.isArray(body) ? body : []);
   return {
     currency: (items[0] && items[0].currency) || 'USD',
@@ -123,6 +123,23 @@ async function ociProbe() {
     steps.push({ step: 'signed runQuery (month cost)', ok: true, summary: { total: cost.total, currency: cost.currency, days: cost.days.length } });
   } catch (e) {
     steps.push({ step: 'signed runQuery (month cost)', ok: false, error: e.message });
+  }
+  // Credential self-test: signed GET on the tenancy record validates the user
+  // OCID + fingerprint + private key independently of the Usage API.
+  try {
+    const idHost = `identity.${c.region}.oci.oraclecloud.com`;
+    const r = await ociRequest(idHost, 'GET', `/20160918/tenancies/${c.tenancy}`, null);
+    const body = await r.json().catch(() => ({}));
+    steps.push({
+      step: 'signed GET identity tenancy (credential check)',
+      ok: r.ok,
+      status: r.status,
+      name: body.name,
+      homeRegion: body.home_region,
+      bodyPreview: r.ok ? undefined : JSON.stringify(body).slice(0, 200),
+    });
+  } catch (e) {
+    steps.push({ step: 'signed GET identity tenancy (credential check)', ok: false, error: e.message });
   }
   return {
     region: c.region,
