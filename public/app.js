@@ -26,9 +26,9 @@ async function loadStatus() {
   }
 }
 
-// Coolify's /servers/{uuid}/metrics returns { data: [sample, ...] } from Sentinel.
-// Network counters are cumulative totals, so we derive bytes/sec deltas.
-// Older/other shapes ({ current, series }) are passed through unchanged.
+// Metrics are fetched server-side from Coolify's MCP server and arrive as
+// { current, series } with [timestamp_ms, value] series pairs.
+// Older/other shapes are passed through unchanged.
 function normalizeMetrics(m) {
   if (!m || !Array.isArray(m.data) || !m.data.length) return m && m.current ? m : null;
   const arr = m.data;

@@ -52,6 +52,73 @@ async function coolify(path_) {
   return res.json();
 }
 
+// Metrics via Coolify's built-in MCP server (/mcp): the REST route
+// /api/v1/servers/{uuid}/metrics was removed from Coolify's API, but the same
+// Bearer token works on /mcp. Streamable HTTP: initialize -> initialized ->
+// tools/call get_server_metrics.
+async function coolifyMcpMetrics(uuid, minutes = 60) {
+  const url = `${coolifyBase()}/mcp`;
+  const headers = {
+    Authorization: `Bearer ${process.env.COOLIFY_TOKEN}`,
+    'Content-Type': 'application/json',
+    Accept: 'application/json, text/event-stream',
+  };
+  const init = await timedFetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: { protocolVersion: '2025-03-26', capabilities: {}, clientInfo: { name: 'monitor-dashboard', version: '1.0.0' } },
+    }),
+  });
+  if (!init.ok) throw new Error(`MCP initialize ${init.status}`);
+  const sessionId = init.headers.get('mcp-session-id');
+  const sessionHeaders = sessionId ? { ...headers, 'mcp-session-id': sessionId } : headers;
+  await init.text().catch(() => '');
+  // The session report (no response expected) and the initialize SSE stream are
+  // both optional in this flow — failures here shouldn't sink the metrics call.
+  await timedFetch(url, {
+    method: 'POST',
+    headers: sessionHeaders,
+    body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+  }).catch(() => {});
+
+  const call = await timedFetch(url, {
+    method: 'POST',
+    headers: sessionHeaders,
+    body: JSON.stringify({
+      jsonrpc: '2.0',
+      id: 2,
+      method: 'tools/call',
+      params: { name: 'get_server_metrics', arguments: { server_uuid: uuid, minutes } },
+    }),
+  });
+  if (!call.ok) throw new Error(`MCP tools/call ${call.status}`);
+  const contentType = call.headers.get('content-type') || '';
+  let payload;
+  if (contentType.includes('text/event-stream')) {
+    const text = await call.text();
+    // Result is the last complete SSE data line of the stream.
+    const lines = text.split('\n').filter((l) => l.startsWith('data:'));
+    if (!lines.length) throw new Error('MCP tools/call returned an empty event stream');
+    payload = JSON.parse(lines[lines.length - 1].slice(5).trim());
+  } else {
+    payload = await call.json();
+  }
+  if (payload.error) throw new Error(`MCP error ${payload.error.code}: ${payload.error.message}`);
+  const result = payload.result || {};
+  if (result.isError) {
+    const msg = (result.content || []).map((c) => c.text).filter(Boolean).join(' ');
+    throw new Error(`MCP tool error: ${msg || 'unknown'}`);
+  }
+  if (result.structuredContent) return result.structuredContent;
+  const textItem = (result.content || []).find((c) => c.type === 'text');
+  if (textItem && textItem.text) return JSON.parse(textItem.text);
+  return result;
+}
+
 app.get('/api/status', (_req, res) => {
   res.json({
     panels: {
@@ -69,11 +136,16 @@ app.get('/api/coolify/resources', async (_req, res) => {
     const servers = await coolify('/api/v1/servers');
     const out = [];
     for (const s of servers.data || []) {
-      const now = Math.floor(Date.now() / 1000);
-      const [metrics, resources] = await Promise.all([
-        coolify(`/api/v1/servers/${s.uuid}/metrics?from=${now - 3600}&to=${now}`).catch(() => null),
+      const [metricsRaw, resources] = await Promise.all([
+        coolifyMcpMetrics(s.uuid).catch((e) => {
+          console.error('[coolify metrics]', s.name, e.message);
+          return null;
+        }),
         coolify(`/api/v1/servers/${s.uuid}/resources`).catch(() => null),
       ]);
+      // MCP wraps the payload as { data: { current, series } }; unwrap so the
+      // client's normalizeMetrics sees the { current, series } shape directly.
+      const metrics = metricsRaw && metricsRaw.data && metricsRaw.data.current ? metricsRaw.data : metricsRaw;
       out.push({ server: s, metrics, resources });
     }
     const apps = await coolify('/api/v1/applications').catch(() => null);
@@ -117,10 +189,22 @@ app.get('/api/debug/coolify', async (_req, res) => {
   const serversBody = (steps.find((s) => /servers/.test(s.step)) || {}).bodyPreview || '';
   // Preview is truncated, so pull uuids by regex rather than parsing the JSON.
   const serverUuids = [...serversBody.matchAll(/"uuid":"([a-z0-9]+)"/g)].map((m) => m[1]);
-  // The metrics call is a prime suspect for hangs — test it with the exact range the panel uses.
-  for (const u of serverUuids.slice(0, 2)) {
-    const now = Math.floor(Date.now() / 1000);
-    await stepFetch(`GET /servers/${u}/metrics (auth)`, `/api/v1/servers/${u}/metrics?from=${now - 3600}&to=${now}`, true);
+  // Metrics come from the MCP server (/mcp) — verify the full handshake here.
+  for (const u of serverUuids.slice(0, 1)) {
+    const t0 = Date.now();
+    try {
+      const m = await coolifyMcpMetrics(u);
+      const unwrapped = m && m.data && m.data.current ? m.data : m;
+      steps.push({
+        step: `MCP get_server_metrics (${u})`,
+        ok: Boolean(unwrapped && unwrapped.current),
+        ms: Date.now() - t0,
+        online: unwrapped && unwrapped.online,
+        seriesKeys: unwrapped && unwrapped.series ? Object.keys(unwrapped.series) : [],
+      });
+    } catch (e) {
+      steps.push({ step: `MCP get_server_metrics (${u})`, ok: false, ms: Date.now() - t0, error: e.message });
+    }
   }
   res.json({ baseHost, tokenShape, steps, serverUuids });
 });

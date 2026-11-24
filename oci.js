@@ -66,20 +66,20 @@ function ociRequest(host, method, path_, body) {
 }
 
 // Month-to-date OCI spend, from the Usage API (Cost query, daily granularity).
-async function ociMonthCost() {
+// hostOverride lets the diagnostics probe the same query against other regions.
+async function ociMonthCost(hostOverride) {
   const c = ociConfig();
-  const host = usageHost();
+  const host = hostOverride || usageHost();
   const start = new Date();
   start.setUTCDate(1);
   start.setUTCHours(0, 0, 0, 0);
   const end = new Date(Date.now() + 24 * 3600 * 1000); // usage API needs the day boundary
   const res = await ociRequest(host, 'POST', '/20200107/actions/runQuery', {
-    queryType: 'usage',
+    queryType: 'COST',
     tenantId: c.tenancy,
     timeUsageStarted: start.toISOString(),
     timeUsageEnded: end.toISOString(),
     granularity: 'DAILY',
-    queryType: 'COST',
     filter: { tags: [], compartmentFilters: [], dimensions: [], freeformTagFilters: [] },
   });
   const body = await res.json().catch(() => ({}));
@@ -135,11 +135,24 @@ async function ociProbe() {
       ok: r.ok,
       status: r.status,
       name: body.name,
-      homeRegion: body.home_region,
+      homeRegion: body.homeRegion || body.home_region, // Identity API returns camelCase
       bodyPreview: r.ok ? undefined : JSON.stringify(body).slice(0, 200),
     });
   } catch (e) {
     steps.push({ step: 'signed GET identity tenancy (credential check)', ok: false, error: e.message });
+  }
+  // Region matrix: sign the identical runQuery against other region endpoints.
+  // If these succeed, the stockholm endpoint rejects the query itself (service
+  // gating/region scope); if they 404 too, the problem is the query/IAM, not the region.
+  const altHosts = ['usageapi.eu-frankfurt-1.oci.oraclecloud.com', 'usageapi.us-ashburn-1.oci.oraclecloud.com'];
+  for (const alt of altHosts.filter((h) => h !== host)) {
+    const t0 = Date.now();
+    try {
+      const cost = await ociMonthCost(alt);
+      steps.push({ step: `runQuery vs ${alt}`, ok: true, ms: Date.now() - t0, summary: { total: cost.total, days: cost.days.length } });
+    } catch (e) {
+      steps.push({ step: `runQuery vs ${alt}`, ok: false, ms: Date.now() - t0, error: e.message });
+    }
   }
   return {
     region: c.region,
