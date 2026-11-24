@@ -35,10 +35,17 @@ function usageHost() {
 }
 
 // Telemetry (monitoring) API — same signing, different service per region.
-function telemetryHost() {
+// The reader host differs between realms: telemetry.<r>.oci.oraclecloud.com vs
+// telemetry.<r>.oraclecloud.com (on some regions the .oci. host routes to the
+// ingestion service and POSTs there fail with a "use telemetry-ingestion" hint).
+// Update with OCI_METRICS_REGION to override the region.
+function telemetryHosts() {
   const region = process.env.OCI_METRICS_REGION || (process.env.OCI_REGION || '').trim();
-  return `telemetry.${region}.oci.oraclecloud.com`;
+  const hosts = [`telemetry.${region}.oci.oraclecloud.com`, `telemetry.${region}.oraclecloud.com`];
+  if (process.env.OCI_TELEMETRY_HOST) hosts.unshift(process.env.OCI_TELEMETRY_HOST);
+  return hosts;
 }
+let telemetryHostCache = null;
 
 function ociRequest(host, method, path_, body) {
   const c = ociConfig();
@@ -99,15 +106,23 @@ async function ociMonthCost(hostOverride) {
     };
   };
 
-  let usageErr = null;
-  try {
-    const res = await ociRequest(host, 'POST', '/20200107/usage', { ...common, queryType: ['COST'] });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`OCI /usage ${res.status} ${JSON.stringify(body).slice(0, 300)}`);
-    if (Array.isArray(body.items)) return parse(body.items);
-    throw new Error(`OCI /usage unexpected body ${JSON.stringify(body).slice(0, 200)}`);
-  } catch (e) {
-    usageErr = e;
+  // Auth is proven (the 400s from stockholm were signature-validated); the
+  // remaining variable is the exact body shape of RequestSummarizedUsages.
+  const variants = [
+    { name: 'queryType array', body: { ...common, queryType: ['COST'] } },
+    { name: 'queryType string', body: { ...common, queryType: 'COST' } },
+  ];
+  const errors = [];
+  for (const v of variants) {
+    try {
+      const res = await ociRequest(host, 'POST', '/20200107/usage', v.body);
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(`OCI /usage (${v.name}) ${res.status} ${JSON.stringify(body).slice(0, 300)}`);
+      if (Array.isArray(body.items)) return parse(body.items);
+      throw new Error(`OCI /usage (${v.name}) unexpected body ${JSON.stringify(body).slice(0, 200)}`);
+    } catch (e) {
+      errors.push(e.message);
+    }
   }
 
   try {
@@ -120,7 +135,7 @@ async function ociMonthCost(hostOverride) {
     if (!res.ok) throw new Error(`OCI runQuery ${res.status} ${body.code || ''}: ${body.message || 'no message'}`.trim());
     return parse(body.items);
   } catch (e) {
-    throw new Error(`${usageErr.message}; ${e.message}`);
+    throw new Error(`${errors.join('; ')}; ${e.message}`);
   }
 }
 
@@ -130,7 +145,6 @@ async function ociMonthCost(hostOverride) {
 // streams (the only instance in this tenancy, so streams usually collapse).
 async function ociComputeMetrics(minutes = 180) {
   const c = ociConfig();
-  const host = telemetryHost();
   const end = new Date();
   const start = new Date(Date.now() - minutes * 60 * 1000);
   const base = {
@@ -155,20 +169,40 @@ async function ociComputeMetrics(minutes = 180) {
     return [...byTs.entries()].sort((a, b) => a[0] - b[0]).map(([ts, acc]) => [ts, acc.sum / acc.n]);
   };
 
-  const grab = async (metric) => {
-    const res = await ociRequest(host, 'POST', '/20180401/metrics', { ...base, name: metric });
-    const body = await res.json().catch(() => ({}));
-    if (!res.ok) throw new Error(`Telemetry ${metric} ${res.status} ${JSON.stringify(body).slice(0, 300)}`);
-    return seriesFor(body, metric);
+  // Try the cached-good reader host first, then discover among the candidates.
+  const summarize = async (metric) => {
+    const hosts = [];
+    if (telemetryHostCache) hosts.push(telemetryHostCache);
+    for (const h of telemetryHosts()) if (!hosts.includes(h)) hosts.push(h);
+    let lastErr = '';
+    for (const h of hosts) {
+      try {
+        const res = await ociRequest(h, 'POST', '/20180401/metrics', { ...base, name: metric });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok) {
+          telemetryHostCache = h;
+          return body;
+        }
+        lastErr = `${h}: ${res.status} ${JSON.stringify(errCode(body) || body).slice(0, 200)}`;
+      } catch (e) {
+        lastErr = `${h}: ${e.message}`;
+      }
+    }
+    throw new Error(`Telemetry ${metric} — ${lastErr}`);
   };
-  const [cpu, memory, filesystem] = await Promise.all([grab('CpuUtilization'), grab('MemoryUtilization'), grab('FilesystemCapacityUtilization')]);
+  const [cpu, memory, filesystem] = await Promise.all([summarize('CpuUtilization'), summarize('MemoryUtilization'), summarize('FilesystemCapacityUtilization')]);
   return {
     minutes,
-    host: host,
-    cpu,
-    memory,
-    filesystem,
+    host: telemetryHostCache,
+    cpu: seriesFor(cpu, 'CpuUtilization'),
+    memory: seriesFor(memory, 'MemoryUtilization'),
+    filesystem: seriesFor(filesystem, 'FilesystemCapacityUtilization'),
   };
+}
+
+// Short "code: message" pair from an OCI error body, for compact error strings.
+function errCode(body) {
+  return body && body.code ? { code: body.code, message: body.message } : body;
 }
 
 // Diagnostic: config sanity + endpoint reachability + a real signed runQuery.
@@ -222,7 +256,9 @@ async function ociProbe() {
   {
     const t0 = Date.now();
     try {
-      const r = await ociRequest(`identity.${c.region}.oci.oraclecloud.com`, 'GET', '/20160918/compartments', null);
+      // compartmentId is a required query param on this route (its 400 told us
+      // auth was fine — this was a probe bug, not an IAM signal).
+      const r = await ociRequest(`identity.${c.region}.oci.oraclecloud.com`, 'GET', `/20160918/compartments?compartmentId=${encodeURIComponent(c.tenancy)}`, null);
       const body = await r.json().catch(() => ({}));
       steps.push({
         step: 'GET identity compartments (IAM visibility)',
@@ -262,6 +298,7 @@ async function ociProbe() {
     steps.push({
       step: 'telemetry oci_computeagent (1h)',
       ok: t.cpu.length > 0 || t.memory.length > 0,
+      host: t.host,
       datapoints: { cpu: t.cpu.length, memory: t.memory.length, filesystem: t.filesystem.length },
     });
   } catch (e) {
