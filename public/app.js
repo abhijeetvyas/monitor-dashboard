@@ -312,7 +312,8 @@ function setStat(name, { value, unit, pct, thresh, spark, note }) {
   if (spark !== undefined) {
     const slot = $(`stat-${name}-spark`);
     slot.innerHTML = spark || '';
-    if (spark) slot.firstChild.className = 'spark' + (thresh ? ' over' : '');
+    const svg = slot.firstElementChild;
+    if (svg) svg.setAttribute('class', 'spark' + (thresh ? ' over' : '')); // SVG className is read-only
   }
   const noteEl = $(`stat-${name}-note`);
   setText(`stat-${name}-note`, note || '');
@@ -485,6 +486,11 @@ function renderApps(applications) {
 // Loaders
 // ---------------------------------------------------------------------------
 async function loadCoolify() {
+  const appsError = (e) => {
+    $('lg-apps').innerHTML = '';
+    document.querySelector('#apps-table tbody').innerHTML =
+      `<tr><td colspan="3"><div class="warn-inline">Coolify unreachable: ${e.message}</div></td></tr>`;
+  };
   try {
     const r = await fetch(`/api/coolify/resources?minutes=${rangeMinutes}`);
     if (!r.ok) {
@@ -495,15 +501,21 @@ async function loadCoolify() {
     const body = await r.json();
     const srv = (body.servers && body.servers[0]) || {};
     const metrics = srv.metrics && srv.metrics.current ? srv.metrics : null;
-    if (metrics) { lastGoodMetrics = metrics; renderStats(metrics); renderCharts(metrics); }
-    if (body.applications) renderApps(body.applications);
+    if (metrics) {
+      lastGoodMetrics = metrics;
+      try { renderStats(metrics); } catch (e) { console.error('renderStats:', e); }
+      try { renderCharts(metrics); } catch (e) { console.error('renderCharts:', e); }
+    }
+    if (body.applications) {
+      try { renderApps(body.applications); } catch (e) { appsError(e); }
+    }
     sourceState.coolify = 'ok';
   } catch (e) {
     sourceState.coolify = 'err';
-    if (lastGoodMetrics && $('stat-cpu-val').textContent === '–') renderStats(lastGoodMetrics);
-    $('lg-apps').innerHTML = '';
-    document.querySelector('#apps-table tbody').innerHTML =
-      `<tr><td colspan="3"><div class="warn-inline">Coolify unreachable: ${e.message}</div></td></tr>`;
+    if (lastGoodMetrics && $('stat-cpu-val').textContent === '–') {
+      try { renderStats(lastGoodMetrics); } catch (err) { console.error('renderStats:', err); }
+    }
+    appsError(e);
   }
 }
 
