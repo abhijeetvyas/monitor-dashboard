@@ -130,16 +130,18 @@ app.get('/api/status', (_req, res) => {
   });
 });
 
-app.get('/api/coolify/resources', async (_req, res) => {
+app.get('/api/coolify/resources', async (req, res) => {
   if (!coolifyConfigured()) return res.status(503).json({ error: 'COOLIFY_TOKEN / COOLIFY_BASE_URL not set' });
   try {
+    // Optional time window for Sentinel history (?minutes=60..43200, default 24h).
+    const minutes = Math.min(43200, Math.max(60, parseInt(req.query.minutes, 10) || 1440));
     const serversBody = await coolify('/api/v1/servers');
     // Coolify v4 returns bare arrays for list endpoints (no { data } envelope).
     const serverList = Array.isArray(serversBody) ? serversBody : serversBody.data || [];
     const out = [];
     for (const s of serverList) {
       const [metricsRaw, resources] = await Promise.all([
-        getCachedMetrics(s.uuid).catch((e) => {
+        getCachedMetrics(s.uuid, minutes).catch((e) => {
           console.error('[coolify metrics]', s.name, e.message);
           return null;
         }),
@@ -158,16 +160,22 @@ app.get('/api/coolify/resources', async (_req, res) => {
   }
 });
 
-// Sentinel metrics cache: 24h of history per server, 60s TTL — the dashboard
+// Sentinel metrics cache: keyed per (server, window), 60s TTL — the dashboard
 // refresh loop (and multiple tabs) reuse one MCP handshake instead of renewing
 // it per request.
 const METRICS_TTL_MS = 60_000;
-const metricsCache = new Map(); // uuid -> { t, data }
-async function getCachedMetrics(uuid) {
-  const hit = metricsCache.get(uuid);
+const metricsCache = new Map(); // `${uuid}:${minutes}` -> { t, data }
+async function getCachedMetrics(uuid, minutes = 1440) {
+  const key = `${uuid}:${minutes}`;
+  const hit = metricsCache.get(key);
   if (hit && Date.now() - hit.t < METRICS_TTL_MS) return hit.data;
-  const data = await coolifyMcpMetrics(uuid, 1440);
-  metricsCache.set(uuid, { t: Date.now(), data });
+  const data = await coolifyMcpMetrics(uuid, minutes);
+  metricsCache.set(key, { t: Date.now(), data });
+  // Keep the map bounded: drop entries for other windows beyond 8 distinct keys.
+  if (metricsCache.size > 8) {
+    const oldest = [...metricsCache.entries()].sort((a, b) => a[1].t - b[1].t)[0];
+    metricsCache.delete(oldest[0]);
+  }
   return data;
 }
 
