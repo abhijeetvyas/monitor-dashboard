@@ -7,53 +7,288 @@
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
   <style>
     :root {
-      --bg: #0e1116; --card: #171c24; --ink: #e6ebf2; --muted: #8b96a5;
-      --ok: #3fb950; --warn: #d29922; --bad: #f85149; --accent: #58a6ff;
+      --bg: #09090b;
+      --card: #101013;
+      --card-hover: #131316;
+      --border: rgba(255, 255, 255, 0.07);
+      --border-strong: rgba(255, 255, 255, 0.14);
+      --ink: #f4f4f5;
+      --muted: #8e8e96;
+      --faint: #5c5c64;
+      --blue: #4f8ef7;
+      --violet: #a78bfa;
+      --green: #10b981;
+      --red: #ef4444;
+      --orange: #f59e0b;
+      --teal: #14b8a6;
+      --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
     }
     * { box-sizing: border-box; }
-    body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, "Segoe UI", sans-serif; }
-    header { display: flex; align-items: baseline; gap: 12px; padding: 16px 24px 4px; }
-    header h1 { font-size: 18px; margin: 0; }
-    header span { color: var(--muted); font-size: 12px; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 16px; padding: 16px 24px 32px; }
-    .card { background: var(--card); border: 1px solid #232b36; border-radius: 10px; padding: 14px 16px; }
-    .card h2 { font-size: 13px; margin: 0 0 2px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; }
-    .kpi { font-size: 26px; font-weight: 600; }
-    .kpi small { font-size: 13px; font-weight: 400; color: var(--muted); }
-    .bar { height: 6px; background: #232b36; border-radius: 3px; margin-top: 8px; overflow: hidden; }
-    .bar > div { height: 100%; border-radius: 3px; background: var(--ok); }
-    .chart-wrap { position: relative; height: 180px; }
+    html { background: var(--bg); }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    b { font-weight: 600; }
+    a { color: inherit; text-decoration: none; }
+    a:hover { text-decoration: underline; text-underline-offset: 3px; text-decoration-color: var(--faint); }
+
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 22px 28px 18px; max-width: 1280px; margin: 0 auto;
+    }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .logo {
+      width: 34px; height: 34px; border-radius: 9px; position: relative; flex: none;
+      background: linear-gradient(135deg, #4f8ef7, #8b5cf6 55%, #d946ef);
+      box-shadow: 0 4px 18px rgba(79, 142, 247, 0.25);
+    }
+    header h1 { font-size: 19px; font-weight: 700; letter-spacing: -0.02em; margin: 0; }
+    .sub { color: var(--muted); font-size: 12px; margin-top: 1px; }
+    .live {
+      display: flex; align-items: center; gap: 8px;
+      font-size: 12px; color: var(--muted);
+      border: 1px solid var(--border); border-radius: 999px; padding: 6px 12px;
+      background: var(--card);
+    }
+    .live .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); flex: none; }
+    .live.ok .dot { background: var(--green); animation: pulse 2.2s ease infinite; }
+    .live.degraded .dot { background: var(--orange); }
+    .live.down .dot { background: var(--red); animation: pulse 1.1s ease infinite; }
+    .live b { color: var(--ink); font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+    .wrap { max-width: 1280px; margin: 0 auto; padding: 0 28px 28px; }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px 18px;
+      transition: border-color 0.15s ease, background 0.15s ease;
+      min-width: 0;
+    }
+    .card:hover { border-color: var(--border-strong); }
+
+    /* ---- overview stat strip ---- */
+    .stats {
+      display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 12px; margin-bottom: 12px;
+    }
+    .stat { display: flex; flex-direction: column; padding: 14px 16px; }
+    .stat-label {
+      color: var(--muted); font-size: 10.5px; font-weight: 600;
+      text-transform: uppercase; letter-spacing: 0.09em;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .stat-label .tag { color: var(--faint); font-weight: 500; letter-spacing: 0.03em; }
+    .stat-value { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 26px; font-weight: 600; margin-top: 6px; line-height: 1.1; }
+    .stat-value small { font-size: 13px; font-weight: 500; color: var(--muted); margin-left: 2px; }
+    .bar {
+      height: 3px; background: rgba(255, 255, 255, 0.08);
+      border-radius: 2px; margin-top: 10px; overflow: hidden;
+    }
+    .bar > div {
+      height: 100%; width: 0; border-radius: 2px;
+      background: var(--green);
+      transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1), background 0.3s ease;
+    }
+    .spark-slot { height: 30px; margin-top: auto; padding-top: 8px; }
+    .spark { width: 100%; height: 100%; display: block; }
+    .stat-note { color: var(--faint); font-size: 11px; margin-top: 7px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+    /* ---- chart cards ---- */
+    .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+    .card.chart { display: flex; flex-direction: column; padding-bottom: 10px; }
+    .span2 { grid-column: span 2; }
+    .card-head {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 12px; margin-bottom: 12px;
+    }
+    .card-head h2 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+    .legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    .lg { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .lg i { width: 8px; height: 8px; border-radius: 3px; flex: none; }
+    .lg b { font-family: var(--mono); font-variant-numeric: tabular-nums; color: var(--ink); font-weight: 600; }
+    .chart-wrap { position: relative; height: 190px; }
+    .chart-wrap.tall { height: 230px; }
+
+    .pill {
+      display: inline-flex; align-items: center; gap: 6px;
+      padding: 2px 9px; border-radius: 999px; font-size: 11.5px; font-weight: 500;
+      font-family: var(--mono);
+    }
+    .pill::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+    .pill.ok { background: rgba(16, 185, 129, 0.12); color: #34d399; }
+    .pill.warn { background: rgba(245, 158, 11, 0.12); color: #fbbf24; }
+    .pill.bad { background: rgba(239, 68, 68, 0.12); color: #f87171; }
+
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
-    th { text-align: left; color: var(--muted); font-weight: 500; padding: 4px 6px; border-bottom: 1px solid #232b36; }
-    td { padding: 6px; border-bottom: 1px solid #1c232d; }
-    .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; }
-    .pill.running { background: rgba(63,185,80,.15); color: var(--ok); }
-    .pill.other { background: rgba(248,81,73,.15); color: var(--bad); }
+    th {
+      text-align: left; color: var(--faint); font-weight: 500; font-size: 11px;
+      text-transform: uppercase; letter-spacing: 0.07em;
+      padding: 0 8px 8px; border-bottom: 1px solid var(--border);
+    }
+    td { padding: 9px 8px; border-bottom: 1px solid rgba(255, 255, 255, 0.04); }
+    tr:last-child > td { border-bottom: none; }
+    td.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+    td .dom { color: var(--muted); font-family: var(--mono); font-size: 12px; }
+
+    .kpi { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 30px; font-weight: 600; letter-spacing: -0.01em; }
+    .kpi small { font-size: 13px; font-weight: 500; color: var(--muted); }
     .note { color: var(--muted); font-size: 12px; }
-    .warn { color: var(--warn); font-size: 12px; margin-top: 6px; }
+    .warn-inline {
+      color: #fbbf24; background: rgba(245, 158, 11, 0.08); border: 1px solid rgba(245, 158, 11, 0.15);
+      border-radius: 8px; padding: 8px 12px; font-size: 12px;
+    }
+
+    footer {
+      max-width: 1280px; margin: 0 auto; padding: 4px 28px 30px;
+      color: var(--faint); font-size: 11.5px;
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    }
+    footer span { display: inline-flex; align-items: center; gap: 6px; }
+    footer i { width: 5px; height: 5px; border-radius: 50%; background: var(--faint); display: inline-block; }
+    footer i.on { background: var(--green); }
+    footer i.off { background: var(--faint); }
+
+    @media (max-width: 900px) {
+      .charts { grid-template-columns: 1fr; }
+      .span2 { grid-column: span 1; }
+      .charts .chart { grid-column: span 1; }
+      header { padding: 18px 20px 14px; }
+      .wrap { padding: 0 20px 20px; }
+      footer { padding: 4px 20px 24px; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>Infra Dashboard</h1>
-    <span>Oracle + Coolify · target: stay within OCI Always Free (4 vCPU · 24 GB RAM)</span>
+    <div class="brand">
+      <div class="logo"></div>
+      <div>
+        <h1>Infra Dashboard</h1>
+        <div class="sub">AppsForLife · Oracle Cloud eu-stockholm-1 · Coolify Sentinel</div>
+      </div>
+    </div>
+    <div class="live" id="live"><span class="dot"></span><span id="live-text">connecting…</span></div>
   </header>
 
-  <div class="warn" id="top-warn" style="margin: 4px 24px 0;"></div>
+  <div class="wrap">
+    <section class="stats">
+      <div class="card stat">
+        <div class="stat-label"><span>CPU</span><span class="tag">sentinel</span></div>
+        <div class="stat-value" id="stat-cpu-val">–</div>
+        <div class="bar"><div id="stat-cpu-bar"></div></div>
+        <div class="spark-slot" id="stat-cpu-spark"></div>
+        <div class="stat-note" id="stat-cpu-note"></div>
+      </div>
+      <div class="card stat">
+        <div class="stat-label"><span>Memory</span><span class="tag">sentinel</span></div>
+        <div class="stat-value" id="stat-mem-val">–</div>
+        <div class="bar"><div id="stat-mem-bar"></div></div>
+        <div class="spark-slot" id="stat-mem-spark"></div>
+        <div class="stat-note" id="stat-mem-note"></div>
+      </div>
+      <div class="card stat">
+        <div class="stat-label"><span>Disk</span><span class="tag">sentinel</span></div>
+        <div class="stat-value" id="stat-disk-val">–</div>
+        <div class="bar"><div id="stat-disk-bar"></div></div>
+        <div class="spark-slot" id="stat-disk-spark"></div>
+        <div class="stat-note" id="stat-disk-note"></div>
+      </div>
+      <div class="card stat">
+        <div class="stat-label"><span>Network</span><span class="tag">sentinel</span></div>
+        <div class="stat-value" id="stat-net-val">–</div>
+        <div class="spark-slot" id="stat-net-spark"></div>
+        <div class="stat-note" id="stat-net-note"></div>
+      </div>
+      <div class="card stat">
+        <div class="stat-label"><span>Load</span><span class="tag">sentinel</span></div>
+        <div class="stat-value" id="stat-load-val">–</div>
+        <div class="bar"><div id="stat-load-bar"></div></div>
+        <div class="spark-slot" id="stat-load-spark"></div>
+        <div class="stat-note" id="stat-load-note"></div>
+      </div>
+    </section>
 
-  <div class="grid">
-    <div class="card"><h2>CPU</h2><div class="kpi" id="cpu-kpi">–</div><div class="bar"><div id="cpu-bar"></div></div><div class="note" id="cpu-note"></div></div>
-    <div class="card"><h2>Memory</h2><div class="kpi" id="mem-kpi">–</div><div class="bar"><div id="mem-bar"></div></div><div class="note" id="mem-note"></div></div>
-    <div class="card"><h2>Disk</h2><div class="kpi" id="disk-kpi">–</div><div class="bar"><div id="disk-bar"></div></div><div class="note" id="disk-note"></div></div>
+    <section class="charts">
+      <div class="card chart span2">
+        <div class="card-head">
+          <h2>CPU — 24 hours</h2>
+          <div class="legend"><span class="lg"><i style="background: var(--blue)"></i>CPU&nbsp;% <b id="lg-cpu">–</b></span></div>
+        </div>
+        <div class="chart-wrap tall"><canvas id="chart-cpu"></canvas></div>
+      </div>
 
-    <div class="card"><h2>Apps</h2><table id="apps-table"><thead><tr><th>App</th><th>URL</th><th>Status</th></tr></thead><tbody></tbody></table><div class="warn" id="apps-warn"></div></div>
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Memory used</h2>
+          <div class="legend"><span class="lg"><i style="background: var(--violet)"></i>RAM <b id="lg-mem">–</b></span></div>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-mem"></canvas></div>
+      </div>
 
-    <div class="card"><h2>CPU & RAM (last hour)</h2><div class="chart-wrap"><canvas id="chart-res"></canvas></div></div>
-    <div class="card"><h2>Network I/O (last hour)</h2><div class="chart-wrap"><canvas id="chart-net"></canvas></div></div>
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Network throughput</h2>
+          <div class="legend">
+            <span class="lg"><i style="background: var(--green)"></i>RX <b id="lg-rx">–</b></span>
+            <span class="lg"><i style="background: var(--orange)"></i>TX <b id="lg-tx">–</b></span>
+          </div>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-net"></canvas></div>
+      </div>
 
-    <div class="card"><h2>Traffic — Cloudflare (24h)</h2><div id="cf-body"><div class="note">Not configured. Set CF_API_TOKEN + CF_ZONE_IDS.</div></div></div>
-    <div class="card"><h2>Cost — Oracle Cloud</h2><div id="oci-body"><div class="note">Not configured yet. Panel activates with OCI credentials.</div></div></div>
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Load average (1 min)</h2>
+          <div class="legend"><span class="lg"><i style="background: var(--teal)"></i>load1 <b id="lg-load">–</b></span></div>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-load"></canvas>
+        </div>
+      </div>
+
+      <div class="card chart">
+        <div class="card-head">
+          <h2>Disk usage — boot volume</h2>
+          <div class="legend"><span class="lg"><i style="background: var(--red)"></i>used&nbsp;% <b id="lg-disk">–</b></span></div>
+        </div>
+        <div class="chart-wrap"><canvas id="chart-disk"></canvas></div>
+      </div>
+
+      <div class="card chart" id="card-cost" style="display: none;">
+        <div class="card-head">
+          <h2>Cost — Oracle Cloud</h2>
+          <div class="legend"><span class="lg"><i style="background: var(--blue)"></i>daily <b id="lg-cost">–</b></span></div>
+        </div>
+        <div class="kpi" id="cost-kpi">–</div>
+        <div class="note" id="cost-note" style="margin: 2px 0 12px;"></div>
+        <div class="chart-wrap" style="height: 110px;"><canvas id="chart-cost"></canvas></div>
+      </div>
+
+      <div class="card chart" id="card-apps">
+        <div class="card-head">
+          <h2>Applications</h2>
+          <div class="legend"><span class="lg" id="lg-apps"></span></div>
+        </div>
+        <table id="apps-table">
+          <thead><tr><th>App</th><th>Domain</th><th style="text-align:right">Status</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
   </div>
+
+  <footer>
+    <span><i class="on"></i>metrics — Coolify Sentinel</span>
+    <span><i id="src-cost" class="off"></i>cost — Oracle Usage API</span>
+    <span><i id="src-cf" class="off"></i>traffic — Cloudflare <span id="src-cf-note"></span></span>
+    <span>auto-refresh 60s</span>
+  </footer>
 
   <script src="/app.js"></script>
 </body>

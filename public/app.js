@@ -1,261 +1,448 @@
 'use strict';
 /* global Chart */
 
-const fmtGB = (b) => (b / 1024 ** 3).toFixed(b / 1024 ** 3 >= 10 ? 0 : 1) + ' GB';
-const fmtBps = (b) => (b > 1024 * 1024 ? (b / 1024 ** 2).toFixed(1) + ' MB/s' : (b / 1024).toFixed(0) + ' KB/s');
+// ---------------------------------------------------------------------------
+// Formatting (decimal GB / KB to match Coolify's units)
+// ---------------------------------------------------------------------------
+const GB = 1e9;
 const num = (v) => (typeof v === 'number' ? v : parseFloat(v) || 0);
-const statusEl = (id, msg) => { const el = document.getElementById(id); if (el) el.textContent = msg || ''; };
+const fmtGB = (b) => (b / GB).toFixed(b >= 10 * GB ? 1 : 2) + ' GB';
+const fmtBps = (v) =>
+  v >= 1e6 ? (v / 1e6).toFixed(1) + ' MB/s'
+  : v >= 1e5 ? (v / 1e3).toFixed(0) + ' KB/s'
+  : v >= 1e3 ? (v / 1e3).toFixed(1) + ' KB/s'
+  : v.toFixed(0) + ' B/s';
+const fmtPct = (v) => (Math.round(v * 10) / 10) + '%';
 
-function setGauge(kpiId, barId, noteId, text, pct, note) {
-  document.getElementById(kpiId).innerHTML = text;
-  const bar = document.getElementById(barId);
-  bar.style.width = Math.min(pct, 100) + '%';
-  bar.style.background = pct > 80 ? 'var(--bad)' : pct > 60 ? 'var(--warn)' : 'var(--ok)';
-  document.getElementById(noteId).textContent = note || '';
+// Round a chart's top gridline up to a tidy value (Coolify-style auto scale).
+function niceCeil(v) {
+  if (!(v > 0)) return 1;
+  const e = Math.pow(10, Math.floor(Math.log10(v)));
+  const n = v / e;
+  for (const s of [1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10]) if (n <= s) return s * e;
+  return 10 * e;
 }
 
-let statusCache = null;
-let ociMetricsCache = null;
-const chartRegistry = {};
+const $ = (id) => document.getElementById(id);
+const setText = (id, text) => { const el = $(id); if (el) el.textContent = text; };
 
-// Chart.js throws "Canvas is already in use" if a new Chart is created on a
-// canvas that still has a live chart — destroy before redrawing.
+// ---------------------------------------------------------------------------
+// Chart helpers
+// ---------------------------------------------------------------------------
+const chartRegistry = new Map();
+
+// Chart.js throws "Canvas is already in use" if a live chart is attached to a
+// canvas: Chart.getChart() finds any chart (even one created out-of-band),
+// so destroy both it and anything stale in our own registry before drawing.
 function drawChart(canvasId, config) {
-  if (chartRegistry[canvasId]) chartRegistry[canvasId].destroy();
-  chartRegistry[canvasId] = new Chart(document.getElementById(canvasId), config);
+  const canvas = $(canvasId);
+  if (!canvas || typeof Chart === 'undefined') return;
+  let existing = null;
+  try { existing = Chart.getChart(canvas); } catch (_) { /* detached canvas */ }
+  if (existing) { try { existing.destroy(); } catch (_) {} }
+  const reg = chartRegistry.get(canvasId);
+  if (reg && reg !== existing) { try { reg.destroy(); } catch (_) {} }
+  chartRegistry.set(canvasId, new Chart(canvas, config));
 }
 
-async function loadStatus() {
-  try {
-    statusCache = await (await fetch('/api/status')).json();
-    statusEl('top-warn', '');
-  } catch (e) {
-    statusCache = { panels: {}, freeTier: { memoryLimitBytes: 24 * 1024 ** 3, diskLimitBytes: 200 * 1024 ** 3 } };
-    statusEl('top-warn', 'Dashboard API unreachable: ' + e.message);
-  }
+if (typeof Chart !== 'undefined') {
+  Chart.defaults.font.family = getComputedStyle(document.body).fontFamily;
+  Chart.defaults.font.size = 11;
+  Chart.defaults.color = '#8e8e96';
+  Chart.defaults.animation = false;
 }
 
-// Metrics are fetched server-side from Coolify's MCP server and arrive as
-// { current, series } with [timestamp_ms, value] series pairs.
-// Older/other shapes are passed through unchanged.
-function normalizeMetrics(m) {
-  if (!m || !Array.isArray(m.data) || !m.data.length) return m && m.current ? m : null;
-  const arr = m.data;
-  const ts = (x) => Date.parse(x.timestamp || x.created_at || x.time) || 0;
-  const pick = (x, ...names) => { for (const n of names) if (x[n] !== undefined && x[n] !== null) return num(x[n]); return 0; };
-  const latest = arr[arr.length - 1];
-  const net = [];
-  for (let i = 1; i < arr.length; i++) {
-    const dt = (ts(arr[i]) - ts(arr[i - 1])) / 1000;
-    if (dt <= 0) continue;
-    net.push({
-      t: ts(arr[i]),
-      rx: (pick(arr[i], 'network_received_bytes', 'network_rx_bytes') - pick(arr[i - 1], 'network_received_bytes', 'network_rx_bytes')) / dt,
-      tx: (pick(arr[i], 'network_sent_bytes', 'network_tx_bytes') - pick(arr[i - 1], 'network_sent_bytes', 'network_tx_bytes')) / dt,
-    });
-  }
+const TOOLTIP = {
+  backgroundColor: '#17171b',
+  borderColor: 'rgba(255,255,255,.1)',
+  borderWidth: 1,
+  titleColor: '#f4f4f5',
+  bodyColor: '#c9c9cf',
+  padding: 10,
+  boxWidth: 8,
+  boxHeight: 8,
+  usePointStyle: true,
+};
+
+// Line-chart config with a dynamically scaled Y axis: the top gridline sits at
+// a tidy value just above the data peak instead of a fixed 0–100 range, so a
+// 5% CPU line is visible rather than flat against the floor.
+function lineCfg(labels, datasets, yFmt) {
+  const maxV = Math.max(
+    0,
+    ...datasets.flatMap((d) => d.data.filter((v) => typeof v === 'number' && !Number.isNaN(v)))
+  );
   return {
-    current: {
-      cpu_percent: pick(latest, 'cpu_percent'),
-      memory_used_bytes: pick(latest, 'memory_used_bytes'),
-      memory_total_bytes: pick(latest, 'memory_total_bytes'),
-      disk_used_bytes: pick(latest, 'used_disk_bytes'),
-      disk_total_bytes: pick(latest, 'total_disk_bytes'),
-      load1: pick(latest, 'load1'),
-    },
-    series: {
-      cpu_percent: arr.map((x) => [ts(x), pick(x, 'cpu_percent')]),
-      memory_used_bytes: arr.map((x) => [ts(x), pick(x, 'memory_used_bytes')]),
-      network_rx_bytes_per_sec: net.map((p) => [p.t, p.rx]),
-      network_tx_bytes_per_sec: net.map((p) => [p.t, p.tx]),
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: false },
+        tooltip: TOOLTIP,
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          border: { display: false },
+          ticks: { maxTicksLimit: 8, maxRotation: 0, autoSkip: true, padding: 6 },
+        },
+        y: {
+          beginAtZero: true,
+          suggestedMax: niceCeil(maxV * 1.15),
+          border: { display: false },
+          grid: { color: 'rgba(255,255,255,.045)' },
+          ticks: { maxTicksLimit: 5, padding: 8, callback: yFmt },
+        },
+      },
+      elements: {
+        point: { radius: 0, hitRadius: 10, hoverRadius: 3 },
+        line: { borderWidth: 1.8, tension: 0.3 },
+      },
     },
   };
 }
 
-async function loadOciMetrics() {
-  if (!statusCache.panels.oci) return;
+// Tiny inline-SVG sparkline for the overview cards.
+function sparkSVG(points, color) {
+  const pts = points.filter((p) => typeof p[1] === 'number');
+  if (pts.length < 2) return '';
+  const vals = pts.map((p) => p[1]);
+  const min = Math.min(...vals);
+  const max = Math.max(...vals);
+  const span = max - min || 1;
+  const W = 100, H = 28, P = 2;
+  const xy = pts.map((p, i) => [
+    (i / (pts.length - 1)) * (W - 2 * P) + P,
+    (H - P) - ((p[1] - min) / span) * (H - 2 * P),
+  ]);
+  const line = xy.map((p) => p[0].toFixed(1) + ',' + p[1].toFixed(1)).join(' ');
+  const area = `${xy[0][0].toFixed(1)},${H - P} L` + line.replace(/ /g, ' L') + ` L${xy[xy.length - 1][0].toFixed(1)},${H - P} Z`;
+  return `<svg class="spark" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <path d="M${area}" fill="${color}" opacity=".13"/>
+    <polyline points="${line}" fill="none" stroke="${color}" stroke-width="1.5" vector-effect="non-scaling-stroke"/>
+  </svg>`;
+}
+
+const timeLabel = (ts) => new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+
+// ---------------------------------------------------------------------------
+// Status / panel gating
+// ---------------------------------------------------------------------------
+let statusCache = null;
+let lastGoodMetrics = null;
+let lastGoodApps = null;
+const sourceState = { coolify: 'off', cost: 'off', cf: 'off' };
+
+async function loadStatus() {
   try {
-    const r = await fetch('/api/oci/metrics');
-    ociMetricsCache = r.ok ? await r.json() : null;
+    statusCache = await (await fetch('/api/status')).json();
   } catch (e) {
-    ociMetricsCache = null;
+    statusCache = { panels: {}, freeTier: { memoryLimitBytes: 24 * GB, diskLimitBytes: 200 * GB } };
   }
+  sourceState.cf = statusCache.panels.cloudflare ? 'ok' : 'off';
+  $('src-cf-note').textContent = statusCache.panels.cloudflare ? '' : '(not configured)';
+  if (!statusCache.panels.cloudflare) setText('src-cf-note', '(not configured)');
 }
 
-// Gauges + resource chart straight from Oracle's Telemetry API
-// (oci_computeagent): CpuUtilization / MemoryUtilization / FilesystemCapacityUtilization.
-function renderOciMetrics(m) {
-  const ft = statusCache.freeTier;
-  const last = (s) => (Array.isArray(s) && s.length ? s[s.length - 1][1] : null);
-  const cpu = last(m.cpu);
-  const memPct = last(m.memory);
-  const diskPct = last(m.filesystem);
+// ---------------------------------------------------------------------------
+// Overview stat cards — bars use the metric's real denominator:
+//   CPU % of host capacity, Memory used / installed RAM,
+//   Disk used / boot-volume size (NOT the 200 GB billing pool — that share is
+//   only a footnote), load1 / vCPUs.
+// ---------------------------------------------------------------------------
+function barColor(pct) {
+  return pct > 80 ? 'var(--red)' : pct > 55 ? 'var(--orange)' : 'var(--green)';
+}
+
+function setStat(name, { value, unit, pct, color, spark, note }) {
+  setText(`stat-${name}-val`, value);
+  const val = $(`stat-${name}-val`);
+  if (unit) val.insertAdjacentHTML('beforeend', `<small>${unit}</small>`);
+  if (pct !== undefined) {
+    const bar = $(`stat-${name}-bar`);
+    bar.style.width = Math.max(1, Math.min(pct, 100)) + '%';
+    bar.style.background = color || barColor(pct);
+  }
+  if (spark !== undefined) $(`stat-${name}-spark`).innerHTML = spark || '';
+  setText(`stat-${name}-note`, note || '');
+}
+
+function renderStats(m) {
+  const cur = m.current || {};
+  const S = m.series || {};
+  const lastOf = (s) => (Array.isArray(s) && s.length ? s[s.length - 1][1] : null);
+  const last3h = (s) => (Array.isArray(s) ? s.filter((p) => p[0] >= Date.now() - 3 * 3600e3) : []);
+  const stats = (s) => {
+    const v = (Array.isArray(s) ? s : []).map((p) => p[1]).filter((v) => typeof v === 'number');
+    if (!v.length) return null;
+    return { avg: v.reduce((a, b) => a + b, 0) / v.length, min: Math.min(...v), max: Math.max(...v), last: v[v.length - 1] };
+  };
+
+  // CPU
+  const cpu = cur.cpu_percent != null ? num(cur.cpu_percent) : null;
+  const cpuS = stats(S.cpu_percent);
   if (cpu !== null) {
-    setGauge('cpu-kpi', 'cpu-bar', 'cpu-note', `${cpu.toFixed(1)}%`, cpu, 'live from Oracle — CpuUtilization (host)');
+    setStat('cpu', {
+      value: cpu.toFixed(1), unit: '%', pct: cpu,
+      spark: sparkSVG(last3h(S.cpu_percent), '#4f8ef7'),
+      note: cpuS ? `24h avg ${fmtPct(cpuS.avg)} · peak ${fmtPct(cpuS.max)}` : '',
+    });
+    setText('lg-cpu', fmtPct(cpu));
   }
-  if (memPct !== null) {
-    const usedBytes = (memPct / 100) * 24 * 1024 ** 3;
-    setGauge('mem-kpi', 'mem-bar', 'mem-note', `${fmtGB(usedBytes)} <small>used</small>`, memPct,
-      `${memPct.toFixed(0)}% — Oracle MemoryUtilization (of host RAM)`);
+
+  // Memory — used / actually installed RAM (matches Coolify's 6%)
+  const memUsed = cur.memory_used_bytes != null ? num(cur.memory_used_bytes) : null;
+  const memTotal = cur.memory_total_bytes ? num(cur.memory_total_bytes) : 0;
+  if (memUsed !== null) {
+    const pctOf = memTotal ? (memUsed / memTotal) * 100 : 0;
+    setStat('mem', {
+      value: fmtGB(memUsed), unit: '', pct: pctOf,
+      color: barColor(pctOf),
+      spark: sparkSVG(last3h(S.memory_used_bytes), '#a78bfa'),
+      note: `of ${fmtGB(memTotal)} · ${(Math.round(pctOf * 10) / 10).toFixed(1)}% of host RAM`,
+    });
+    setText('lg-mem', fmtGB(memUsed));
   }
-  if (diskPct !== null) {
-    setGauge('disk-kpi', 'disk-bar', 'disk-note', `${diskPct.toFixed(1)}% <small>used</small>`, diskPct,
-      'Oracle FilesystemCapacityUtilization');
+
+  // Disk — bar % is used / boot-volume size (same math as Coolify); the 200 GB
+  // free-tier pool share is a footnote only, so numbers stay honest.
+  const diskUsed = cur.disk_used_bytes != null ? num(cur.disk_used_bytes) : null;
+  const diskTotal = num(cur.disk_total_bytes) || 0;
+  const diskPct = cur.disk_used_percent != null ? num(cur.disk_used_percent) : diskTotal ? (diskUsed / diskTotal) * 100 : null;
+  if (diskPct !== null && diskUsed !== null) {
+    setStat('disk', {
+      value: fmtGB(diskUsed), unit: 'used', pct: diskPct,
+      color: barColor(diskPct),
+      spark: sparkSVG(last3h(S.disk_used_percent), '#ef4444'),
+      note: `of ${fmtGB(diskTotal)} volume · ${(diskPct).toFixed(1)}% full · ${(diskUsed / (200 * GB) * 100).toFixed(1)}% of 200 GB pool`,
+    });
+    setText('lg-disk', fmtPct(diskPct));
   }
-  if (m.cpu && m.cpu.length) {
-    const labels = m.cpu.map((p) => new Date(p[0]).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-    // Memory has its own sampling times; only pair it with the CPU axis when aligned.
-    const memAligned = m.memory && m.memory.length === m.cpu.length ? m.memory.map((p) => p[1]) : null;
-    drawRes(labels, m.cpu.map((p) => p[1]), memAligned || m.cpu.map(() => null));
+
+  // Network — Sentinel already reports bytes/sec (rx/tx)
+  const rx = cur.network_rx_bytes_per_sec != null ? num(cur.network_rx_bytes_per_sec) : null;
+  const tx = cur.network_tx_bytes_per_sec != null ? num(cur.network_tx_bytes_per_sec) : null;
+  if (rx !== null && tx !== null) {
+    let peak = 0;
+    const srx = S.network_rx_bytes_per_sec || [], stx = S.network_tx_bytes_per_sec || [];
+    for (let i = 0; i < Math.min(srx.length, stx.length); i++) peak = Math.max(peak, num(srx[i][1]) + num(stx[i][1]));
+    const sparkPts = last3h(srx).map((p, i) => [p[0], p[1] + (stx[i] ? stx[i][1] : 0)]);
+    setStat('net', {
+      value: fmtBps(rx + tx), unit: 'now',
+      spark: sparkSVG(sparkPts, '#10b981'),
+      note: `rx ${fmtBps(rx)} · tx ${fmtBps(tx)} · 24h peak ${fmtBps(peak)}`,
+    });
+    setText('lg-rx', fmtBps(rx));
+    setText('lg-tx', fmtBps(tx));
+  }
+
+  // Load — bar = load1 / vCPUs
+  const load1 = cur.load1 != null ? num(cur.load1) : null;
+  if (load1 !== null) {
+    const VCPU = 4;
+    const pct = (load1 / VCPU) * 100;
+    const loadS = stats(S.load1);
+    setStat('load', {
+      value: load1.toFixed(2), pct, color: barColor(pct),
+      spark: sparkSVG(last3h(S.load1), '#14b8a6'),
+      note: `${Math.round(pct)}% of ${VCPU} vCPU${loadS ? ` · 24h peak ${loadS.max.toFixed(2)}` : ''}`,
+    });
+    setText('lg-load', load1.toFixed(2));
   }
 }
 
+// ---------------------------------------------------------------------------
+// Charts — same Sentinel series Coolify renders, 24h window
+// ---------------------------------------------------------------------------
+function renderCharts(m) {
+  const S = m.series || {};
+  const labels = (pts) => (pts || []).map((p) => timeLabel(p[0]));
+  const vals = (pts) => (pts || []).map((p) => p[1]);
+  const hideIfEmpty = (cardId, s) => {
+    const c = $(cardId);
+    if (c) c.style.display = Array.isArray(s) && s.length > 1 ? '' : 'none';
+  };
+
+  hideIfEmpty('card-cpu', S.cpu_percent);
+  if (S.cpu_percent && S.cpu_percent.length > 1) {
+    drawChart('chart-cpu', lineCfg(labels(S.cpu_percent), [
+      { label: 'CPU %', data: vals(S.cpu_percent), borderColor: '#4f8ef7', backgroundColor: 'rgba(79,142,247,.09)', fill: true },
+    ], (v) => fmtPct(v)));
+  }
+
+  hideIfEmpty('card-mem', S.memory_used_bytes);
+  if (S.memory_used_bytes && S.memory_used_bytes.length > 1) {
+    drawChart('chart-mem', lineCfg(labels(S.memory_used_bytes), [
+      { label: 'Memory used', data: vals(S.memory_used_bytes), borderColor: '#a78bfa', backgroundColor: 'rgba(167,139,250,.09)', fill: true },
+    ], (v) => fmtGB(v)));
+  }
+
+  hideIfEmpty('card-net', S.network_rx_bytes_per_sec);
+  if (S.network_rx_bytes_per_sec && S.network_rx_bytes_per_sec.length > 1) {
+    drawChart('chart-net', lineCfg(labels(S.network_rx_bytes_per_sec), [
+      { label: 'RX', data: vals(S.network_rx_bytes_per_sec), borderColor: '#10b981' },
+      { label: 'TX', data: vals(S.network_tx_bytes_per_sec) || [], borderColor: '#f59e0b' },
+    ], (v) => fmtBps(v)));
+  }
+
+  hideIfEmpty('card-load', S.load1);
+  if (S.load1 && S.load1.length > 1) {
+    drawChart('chart-load', lineCfg(labels(S.load1), [
+      { label: 'load1', data: vals(S.load1), borderColor: '#14b8a6', backgroundColor: 'rgba(20,184,166,.09)', fill: true },
+    ], (v) => v.toFixed(1)));
+  }
+
+  hideIfEmpty('card-disk', S.disk_used_percent);
+  if (S.disk_used_percent && S.disk_used_percent.length > 1) {
+    drawChart('chart-disk', lineCfg(labels(S.disk_used_percent), [
+      { label: 'Disk used %', data: vals(S.disk_used_percent), borderColor: '#ef4444', backgroundColor: 'rgba(239,68,68,.08)', fill: true },
+    ], (v) => fmtPct(v)));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Applications table — real status per Coolify API
+// ---------------------------------------------------------------------------
+function statusPill(status) {
+  const s = String(status || 'unknown').toLowerCase();
+  const base = s.split(':')[0];
+  const cls = base === 'running' ? 'ok' : (base === 'restarting' || base === 'starting' || base === 'queued') ? 'warn' : 'bad';
+  return `<span class="pill ${cls}">${base}</span>`;
+}
+
+function renderApps(applications) {
+  const tbody = document.querySelector('#apps-table tbody');
+  const n = (applications || []).length;
+  const running = (applications || []).filter((a) => String(a.status).startsWith('running')).length;
+  $('lg-apps').innerHTML = `<b>${running}/${n}</b>&nbsp;running`;
+  if (!n) {
+    tbody.innerHTML = `<tr><td colspan="3"><div class="warn-inline">Coolify returned no applications.</div></td></tr>`;
+    return;
+  }
+  tbody.innerHTML = (applications || []).map((a) => {
+    const dom = String(a.fqdn || '').split(',')[0];
+    return `<tr>
+      <td><b>${a.name}</b></td>
+      <td>${dom ? `<a class="dom" href="https://${dom}" target="_blank" rel="noopener">${dom}</a>` : '<span class="dom">—</span>'}</td>
+      <td style="text-align:right">${statusPill(a.status)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ---------------------------------------------------------------------------
+// Loaders
+// ---------------------------------------------------------------------------
 async function loadCoolify() {
   try {
     const r = await fetch('/api/coolify/resources');
     if (!r.ok) {
       let err = 'HTTP ' + r.status;
-      try { err = (await r.json()).error || err; } catch (_) { /* non-JSON body */ }
-      statusEl('apps-warn', 'Coolify panel unavailable: ' + err);
-      return;
+      try { err = (await r.json()).error || err; } catch (_) {}
+      throw new Error(err);
     }
-    const { servers, applications } = await r.json();
-    statusEl('apps-warn', '');
-    const srv = (servers && servers[0]) || {};
-    const nm = normalizeMetrics(srv.metrics);
-    const cur = nm && nm.current;
-    const ft = statusCache.freeTier;
-
-    // Oracle-direct metrics take priority; Coolify/Sentinel is the fallback
-    // (network series only exists there, so keep it when available).
-    const haveOci = ociMetricsCache && ociMetricsCache.cpu && ociMetricsCache.cpu.length > 0;
-    if (haveOci) {
-      renderOciMetrics(ociMetricsCache);
-      if (cur) {
-        const nm2 = nm;
-        if (nm2.series.network_rx_bytes_per_sec && nm2.series.network_rx_bytes_per_sec.length) {
-          const t = (pts) => pts.map((p) => new Date(p[0]).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-          drawNet(t(nm2.series.network_rx_bytes_per_sec), nm2.series.network_rx_bytes_per_sec.map((p) => p[1]), nm2.series.network_tx_bytes_per_sec.map((p) => p[1]));
-        }
-      }
-    } else if (cur) {
-      const totalMem = cur.memory_total_bytes || ft.memoryLimitBytes;
-      const memPct = (cur.memory_used_bytes / ft.memoryLimitBytes) * 100;
-      const diskPct = (cur.disk_used_bytes / ft.diskLimitBytes) * 100;
-      setGauge('cpu-kpi', 'cpu-bar', 'cpu-note', `${num(cur.cpu_percent).toFixed(1)}%`, num(cur.cpu_percent),
-        `load ${num(cur.load1).toFixed(2)} · Coolify ceiling 100% (free tier: 4 OCPU shared)`);
-      setGauge('mem-kpi', 'mem-bar', 'mem-note', `${fmtGB(cur.memory_used_bytes)} <small>of ${fmtGB(totalMem)}</small>`,
-        (cur.memory_used_bytes / totalMem) * 100,
-        `${memPct.toFixed(0)}% of 24 GB free-tier budget`);
-      setGauge('disk-kpi', 'disk-bar', 'disk-note', `${fmtGB(cur.disk_used_bytes)} <small>used</small>`,
-        cur.disk_total_bytes ? (cur.disk_used_bytes / cur.disk_total_bytes) * 100 : diskPct,
-        `${diskPct.toFixed(0)}% of 200 GB free-tier estimate`);
-
-      const series = nm.series || {};
-      const t = (pts) => pts.map((p) => new Date(p[0]).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-      if (series.cpu_percent && series.cpu_percent.length) drawRes(t(series.cpu_percent), series.cpu_percent.map((p) => p[1]), series.memory_used_bytes.map((p) => (p[1] / totalMem) * 100));
-      if (series.network_rx_bytes_per_sec && series.network_rx_bytes_per_sec.length) drawNet(t(series.network_rx_bytes_per_sec), series.network_rx_bytes_per_sec.map((p) => p[1]), series.network_tx_bytes_per_sec.map((p) => p[1]));
-    }
-
-    const tbody = document.querySelector('#apps-table tbody');
-    tbody.innerHTML = '';
-    for (const a of applications || []) {
-      const ok = String(a.status).startsWith('running');
-      tbody.insertAdjacentHTML('beforeend', `<tr>
-        <td>${a.name}</td>
-        <td class="note">${(a.fqdn || '').split(',')[0]}</td>
-        <td><span class="pill ${ok ? 'running' : 'other'}">${String(a.status).split(':')[0]}</span></td>
-      </tr>`);
-    }
-    if (!applications || !applications.length) statusEl('apps-warn', 'Coolify reachable but no applications were returned.');
+    const { metrics, applications } = pickFirstServer(await r.json());
+    if (metrics && metrics.current) { lastGoodMetrics = metrics; renderStats(metrics); renderCharts(metrics); }
+    if (applications) { lastGoodApps = applications; renderApps(applications); }
+    sourceState.coolify = 'ok';
   } catch (e) {
-    statusEl('apps-warn', 'Coolify panel error: ' + ((e && e.message) || e));
+    sourceState.coolify = 'err';
+    // Keep last good data on screen; surface the failure in the apps legend.
+    if (lastGoodMetrics && !$('stat-cpu-val').textContent.length) { renderStats(lastGoodMetrics); }
+    $('lg-apps').innerHTML = '';
+    document.querySelector('#apps-table tbody').innerHTML =
+      `<tr><td colspan="3"><div class="warn-inline">Coolify unreachable: ${e.message}</div></td></tr>`;
   }
 }
 
-function drawRes(labels, cpu, mem) {
-  drawChart('chart-res', {
-    type: 'line',
-    data: { labels, datasets: [
-      { label: 'CPU %', data: cpu, borderColor: '#58a6ff', tension: .3, pointRadius: 0 },
-      { label: 'RAM % of total', data: mem, borderColor: '#bc8cff', tension: .3, pointRadius: 0 },
-    ]},
-    options: { responsive: true, maintainAspectRatio: false, scales: { y: { ticks: { color: '#8b96a5' }, suggestedMax: 100 }, x: { ticks: { color: '#8b96a5', maxTicksLimit: 6 } } }, plugins: { legend: { labels: { color: '#e6ebf2' } } } },
-  });
-}
-
-function drawNet(labels, rx, tx) {
-  drawChart('chart-net', {
-    type: 'line',
-    data: { labels, datasets: [
-      { label: 'In', data: rx.map(fmtBps), borderColor: '#3fb950', tension: .3, pointRadius: 0 },
-      { label: 'Out', data: tx.map(fmtBps), borderColor: '#d29922', tension: .3, pointRadius: 0 },
-    ]},
-    options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { color: '#8b96a5', maxTicksLimit: 6 } } }, plugins: { legend: { labels: { color: '#e6ebf2' } } } },
-  });
-}
-
-async function loadTraffic() {
-  if (!statusCache.panels.cloudflare) return;
-  try {
-    const r = await fetch('/api/cloudflare/traffic');
-    const body = document.getElementById('cf-body');
-    if (!r.ok) {
-      let err = 'HTTP ' + r.status;
-      try { err = (await r.json()).error || err; } catch (_) { /* non-JSON body */ }
-      body.innerHTML = `<div class="warn">${err}</div>`;
-      return;
-    }
-    const { zones } = await r.json();
-    body.innerHTML = '';
-    for (const z of zones) {
-      const groups = (z.data && z.data.httpRequests1hGroups) || [];
-      const tot = groups.reduce((a, g) => a + (g.sum ? g.sum.requests : 0), 0);
-      const bytes = groups.reduce((a, g) => a + (g.sum ? g.sum.bytes : 0), 0);
-      const uniq = groups.reduce((a, g) => a + (g.uniq ? g.uniq.uniques : 0), 0);
-      body.insertAdjacentHTML('beforeend', `
-        <div class="kpi">${tot.toLocaleString()} <small>requests / 24h</small></div>
-        <div class="note">${bytes ? fmtGB(bytes) + ' bandwidth · ' : ''}${uniq.toLocaleString()} unique visitors</div>`);
-    }
-  } catch (e) {
-    document.getElementById('cf-body').innerHTML = `<div class="warn">${(e && e.message) || e}</div>`;
-  }
+// Server payload: { servers: [ { server, metrics: {current, series}, resources } ], applications }
+function pickFirstServer(body) {
+  const srv = (body.servers && body.servers[0]) || {};
+  const metricsRaw = srv.metrics || {};
+  const metrics = metricsRaw.current ? metricsRaw : null;
+  return { metrics, applications: body.applications };
 }
 
 async function loadCost() {
-  if (!statusCache.panels.oci) return;
+  const card = $('card-cost');
+  if (!statusCache.panels.oci) { card.style.display = 'none'; sourceState.cost = 'off'; return; }
   try {
     const r = await fetch('/api/oci/cost');
-    const body = document.getElementById('oci-body');
-    if (!r.ok) {
-      let err = 'HTTP ' + r.status;
-      try { err = (await r.json()).error || err; } catch (_) { /* non-JSON body */ }
-      body.innerHTML = `<div class="warn">Cost panel: ${err}</div>`;
-      return;
-    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
-    const cur = data.currency === 'USD' ? '$' : data.currency + ' ';
-    const dayLabels = data.days.map((d) => d.date.slice(8) + '/' + d.date.slice(5, 7));
-    body.innerHTML = `
-      <div class="kpi">${cur}${num(data.total).toFixed(2)} <small>month-to-date</small></div>
-      <div class="note">${data.days.map((d) => (d.date || '?') + ': ' + cur + num(d.cost).toFixed(2)).slice(-5).join('<br>')}</div>
-      <div class="chart-wrap"><canvas id="chart-cost"></canvas></div>`;
-    new Chart(document.getElementById('chart-cost'), {
-      type: 'bar',
-      data: { labels: dayLabels, datasets: [{ label: 'Daily cost', data: data.days.map((d) => num(d.cost)), backgroundColor: '#58a6ff' }] },
-      options: { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { color: '#8b96a5' } }, y: { ticks: { color: '#8b96a5' } } }, plugins: { legend: { display: false } } },
-    });
+    const sym = data.currency === 'USD' ? '$' : data.currency === 'EUR' ? '€' : data.currency + ' ';
+    const days = data.days || [];
+    const total = num(data.total);
+    $('cost-kpi').innerHTML = `${sym}${total.toFixed(2)} <small>month-to-date</small>`;
+    setText('lg-cost', sym + total.toFixed(2));
+    const dayOfMonth = days.length ? Number(days[days.length - 1].date.slice(8)) : 0;
+    const proj = total > 0 && dayOfMonth ? (total / dayOfMonth) * 30 : 0;
+    $('cost-note').textContent = days.length
+      ? `${days.length} day${days.length > 1 ? 's' : ''} tracked${total > 0 ? ` · projected ${sym}${proj.toFixed(2)} by month end` : ' · all clear'}`
+      : '';
+    if (days.length) {
+      drawChart('chart-cost', {
+        type: 'bar',
+        data: {
+          labels: days.map((d) => d.date.slice(8) + '/' + d.date.slice(5, 7)),
+          datasets: [{
+            label: 'Daily cost', data: days.map((d) => num(d.cost)),
+            backgroundColor: 'rgba(79,142,247,.75)', hoverBackgroundColor: '#4f8ef7',
+            borderRadius: 3, maxBarThickness: 26,
+          }],
+        },
+        options: {
+          responsive: true, maintainAspectRatio: false,
+          plugins: { legend: { display: false }, tooltip: TOOLTIP },
+          scales: {
+            x: { grid: { display: false }, border: { display: false }, ticks: { maxRotation: 0, padding: 4 } },
+            y: { beginAtZero: true, suggestedMax: niceCeil(Math.max(0.5, total)), border: { display: false }, grid: { color: 'rgba(255,255,255,.045)' }, ticks: { maxTicksLimit: 4, callback: (v) => sym + v } },
+          },
+        },
+      });
+    }
+    card.style.display = '';
+    $('src-cost').className = 'on';
+    sourceState.cost = 'ok';
   } catch (e) {
-    document.getElementById('oci-body').innerHTML = `<div class="warn">Cost panel: ${(e && e.message) || e}</div>`;
+    card.style.display = 'none';
+    $('src-cost').className = 'off';
+    sourceState.cost = 'err';
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Live indicator + refresh loop (single-flight: never overlap cycles)
+// ---------------------------------------------------------------------------
+function renderLive() {
+  const el = $('live');
+  const t = new Date().toLocaleTimeString();
+  if (sourceState.coolify === 'err' && sourceState.cost === 'err') {
+    el.className = 'live down'; setText('live-text', 'offline · ' + t);
+  } else if (sourceState.coolify === 'err' || sourceState.cost === 'err') {
+    el.className = 'live degraded'; setText('live-text', 'partial · ' + t);
+  } else {
+    el.className = 'live ok'; setText('live-text', 'live · ' + t);
+  }
+}
+
+let refreshing = false;
+async function refresh() {
+  if (refreshing) return;
+  refreshing = true;
+  try {
+    if (!statusCache) await loadStatus();
+    await Promise.allSettled([loadCoolify(), loadCost()]);
+    renderLive();
+  } finally {
+    refreshing = false;
   }
 }
 
 (async () => {
   await loadStatus();
-  await loadOciMetrics();
-  await Promise.allSettled([loadCoolify(), loadTraffic(), loadCost()]);
-  setInterval(async () => {
-    await loadOciMetrics();
-    loadCoolify();
-  }, 60_000);
+  await refresh();
+  setInterval(refresh, 60_000);
 })();

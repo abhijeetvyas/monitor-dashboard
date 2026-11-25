@@ -139,14 +139,14 @@ app.get('/api/coolify/resources', async (_req, res) => {
     const out = [];
     for (const s of serverList) {
       const [metricsRaw, resources] = await Promise.all([
-        coolifyMcpMetrics(s.uuid).catch((e) => {
+        getCachedMetrics(s.uuid).catch((e) => {
           console.error('[coolify metrics]', s.name, e.message);
           return null;
         }),
         coolify(`/api/v1/servers/${s.uuid}/resources`).catch(() => null),
       ]);
       // MCP wraps the payload as { data: { current, series } }; unwrap so the
-      // client's normalizeMetrics sees the { current, series } shape directly.
+      // client sees the { current, series } shape directly.
       const metrics = metricsRaw && metricsRaw.data && metricsRaw.data.current ? metricsRaw.data : metricsRaw;
       out.push({ server: s, metrics, resources });
     }
@@ -157,6 +157,19 @@ app.get('/api/coolify/resources', async (_req, res) => {
     res.status(502).json({ error: e.message });
   }
 });
+
+// Sentinel metrics cache: 24h of history per server, 60s TTL — the dashboard
+// refresh loop (and multiple tabs) reuse one MCP handshake instead of renewing
+// it per request.
+const METRICS_TTL_MS = 60_000;
+const metricsCache = new Map(); // uuid -> { t, data }
+async function getCachedMetrics(uuid) {
+  const hit = metricsCache.get(uuid);
+  if (hit && Date.now() - hit.t < METRICS_TTL_MS) return hit.data;
+  const data = await coolifyMcpMetrics(uuid, 1440);
+  metricsCache.set(uuid, { t: Date.now(), data });
+  return data;
+}
 
 // Diagnostic: run the Coolify calls the dashboard makes, report status/timing/
 // raw body preview per step. No secrets echoed (token and base URL are not).
@@ -251,11 +264,17 @@ app.get('/api/cloudflare/traffic', async (_req, res) => {
 
 // ---------------------------------------------------------------------------
 // OCI — month-to-date cost vs free-tier (target: 0, only overage costs money)
+// Cached 5 min: the Usage API throttles per-user (429 TooManyRequests observed)
+// and the 60s frontend loop would otherwise hammer it.
 // ---------------------------------------------------------------------------
+let costCache = { t: 0, data: null };
 app.get('/api/oci/cost', async (_req, res) => {
   if (!ociConfigured()) return res.status(503).json({ error: 'OCI_* env vars not set or private key missing' });
+  if (costCache.data && Date.now() - costCache.t < 5 * 60_000) return res.json(costCache.data);
   try {
-    res.json(await ociMonthCost());
+    const data = await ociMonthCost();
+    costCache = { t: Date.now(), data };
+    res.json(data);
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
