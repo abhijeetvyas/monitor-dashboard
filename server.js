@@ -19,7 +19,12 @@ const FREE_TIER = {
   diskLimitBytes: 200 * 1024 * 1024 * 1024, // OCI Always Free block storage (adjust to actual)
 };
 
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+  // tiny dashboard, freshness matters: never let browsers heuristically cache the app shell
+  setHeaders(res, filePath) {
+    if (filePath.endsWith('.html') || filePath.endsWith('.js')) res.setHeader('Cache-Control', 'no-cache');
+  },
+}));
 
 // ---------------------------------------------------------------------------
 // Coolify (resources + health)
