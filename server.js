@@ -133,9 +133,11 @@ app.get('/api/status', (_req, res) => {
 app.get('/api/coolify/resources', async (_req, res) => {
   if (!coolifyConfigured()) return res.status(503).json({ error: 'COOLIFY_TOKEN / COOLIFY_BASE_URL not set' });
   try {
-    const servers = await coolify('/api/v1/servers');
+    const serversBody = await coolify('/api/v1/servers');
+    // Coolify v4 returns bare arrays for list endpoints (no { data } envelope).
+    const serverList = Array.isArray(serversBody) ? serversBody : serversBody.data || [];
     const out = [];
-    for (const s of servers.data || []) {
+    for (const s of serverList) {
       const [metricsRaw, resources] = await Promise.all([
         coolifyMcpMetrics(s.uuid).catch((e) => {
           console.error('[coolify metrics]', s.name, e.message);
@@ -148,8 +150,9 @@ app.get('/api/coolify/resources', async (_req, res) => {
       const metrics = metricsRaw && metricsRaw.data && metricsRaw.data.current ? metricsRaw.data : metricsRaw;
       out.push({ server: s, metrics, resources });
     }
-    const apps = await coolify('/api/v1/applications').catch(() => null);
-    res.json({ servers: out, applications: apps && apps.data });
+    const appsBody = await coolify('/api/v1/applications').catch(() => null);
+    const applications = Array.isArray(appsBody) ? appsBody : appsBody && appsBody.data;
+    res.json({ servers: out, applications });
   } catch (e) {
     res.status(502).json({ error: e.message });
   }
